@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "models": {
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B": {
+      "warm_samples_sec": [86, 119, 88],
+      "cold_samples_sec": [418],
+      "last_mode": "warm",
+      "last_duration_sec": 88,
+      "notes": "Measured on QB2 p300x2 via Qwen3-32B tt_transformers spec"
+    },
+    "Qwen/Qwen3-32B": {
+      "warm_samples_sec": [86, 119, 88],
+      "cold_samples_sec": [418],
+      "last_mode": "warm",
+      "last_duration_sec": 88,
+      "notes": "Measured on QB2 p300x2 (v0.17.0 / pr55630)"
+    },
+    "Qwen/QwQ-32B": {
+      "warm_samples_sec": [92],
+      "cold_samples_sec": [420],
+      "last_mode": "warm",
+      "last_duration_sec": 92,
+      "notes": "Shares Qwen3-32B 64-layer P300X2 TT-Metal cache geometry"
+    },
+    "Qwen/Qwen2.5-Coder-32B-Instruct": {
+      "warm_samples_sec": [92],
+      "cold_samples_sec": [420],
+      "last_mode": "warm",
+      "last_duration_sec": 92,
+      "notes": "Shares Qwen3-32B 64-layer P300X2 TT-Metal cache geometry"
+    },
+    "Qwen/Qwen3.8-27B": {
+      "warm_samples_sec": [145],
+      "cold_samples_sec": [405],
+      "last_mode": "cold",
+      "last_duration_sec": 405,
+      "notes": "Measured on QB2 p300x2 (v0.25.0 qwen38_27b_qb2, 262K ctx)"
+    },
+    "openai/gpt-oss-120b": {
+      "warm_samples_sec": [210],
+      "cold_samples_sec": [1713],
+      "last_mode": "cold",
+      "last_duration_sec": 1713,
+      "notes": "Measured on QB2 p300x2 (36-layer 128-expert MoE, 70.4 GB TT-Metal cache)"
+    },
+    "meta-llama/Llama-3.1-70B-Instruct": {
+      "warm_samples_sec": [621],
+      "cold_samples_sec": [1367],
+      "last_mode": "warm",
+      "last_duration_sec": 621,
+      "notes": "Measured on QB2 p300x2 (80-layer dense 70B, 69.1 GB TT-Metal cache + 11 trace lengths)"
+    },
+    "meta-llama/Llama-3.1-8B-Instruct": {
+      "warm_samples_sec": [255, 256],
+      "cold_samples_sec": [346],
+      "last_mode": "warm",
+      "last_duration_sec": 256,
+      "notes": "Measured on QB2 p300x2 (32-layer 8B, 9.5 GB TT-Metal cache + 11 trace lengths)"
+    }
+  }
+}

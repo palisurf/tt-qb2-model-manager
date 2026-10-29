@@ -52,6 +52,7 @@ import os
 import re
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import threading
@@ -79,12 +80,17 @@ except ImportError:
 # ==============================================================================
 SCRIPT_DIR = Path("/home/ttuser/model_management")
 FRONTIER_CACHE_FILE = SCRIPT_DIR / "frontier_rankings_cache.json"
+LOAD_TIMINGS_CACHE_FILE = SCRIPT_DIR / "load_timings_cache.json"
 PRIMARY_MODELS_DIR = Path("/home/ttuser/models")
 TT_CACHE_DIR = Path("/home/ttuser/data/tt-cache")
 TT_INFERENCE_DIR = Path("/home/ttuser/.local/lib/tt-inference-server")
 PROD_SPEC_YAML = TT_INFERENCE_DIR / "workflows" / "model_specs" / "prod" / "llm.yaml"
 DEV_SPEC_YAML = TT_INFERENCE_DIR / "workflows" / "model_specs" / "dev" / "llm.yaml"
 DEV_VLM_SPEC_YAML = TT_INFERENCE_DIR / "workflows" / "model_specs" / "dev" / "vlm.yaml"
+
+# Deterministic vLLM trace capture sequence lengths on QB2 (up to 128K context)
+TRACE_CAPTURE_SEQ_LENS = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32640, 65408, 130944]
+TRACE_SEQ_INDEX = {seq_len: idx + 1 for idx, seq_len in enumerate(TRACE_CAPTURE_SEQ_LENS)}
 
 # Patched Docker image containing TT-Metal PR #55630 (prefix-caching slot collisions fix)
 PATCHED_QWEN3_IMAGE = (
@@ -1634,13 +1640,853 @@ def _status_priority(status: str) -> int:
     return 1
 
 
+def _format_duration(seconds: int | float | None) -> str:
+    """Format seconds as human-readable `Xm Ys` or `Xs`."""
+    if seconds is None or seconds <= 0:
+        return "unknown"
+    sec = int(round(seconds))
+    if sec < 60:
+        return f"{sec}s"
+    mins, rem = divmod(sec, 60)
+    return f"{mins}m {rem:02d}s"
+
+
+def _parse_size_to_gb(size_str: str) -> float:
+    """Parse Docker/du size string like `70.43GB`, `91G`, `584MB`, `54.69kB`, `4.0K`, `0B` into float GB."""
+    s = (size_str or "").strip()
+    m = re.match(r"^([\d.]+)\s*(TB|TiB|T|GB|GiB|G|MB|MiB|M|kB|KB|KiB|K|B)$", s, flags=re.I)
+    if not m:
+        return 0.0
+    val = float(m.group(1))
+    unit = m.group(2).upper()
+    if unit in ("TB", "TIB", "T"):
+        return val * 1024.0
+    if unit in ("GB", "GIB", "G"):
+        return val
+    if unit in ("MB", "MIB", "M"):
+        return val / 1024.0
+    if unit in ("KB", "KIB", "K"):
+        return val / (1024.0**2)
+    return val / (1024.0**3)
+
+
+# ==============================================================================
+# ITEM 3: Local `config.json` Model Architecture & Shard Inspector
+# ==============================================================================
+def inspect_model_architecture(local_path: Path) -> dict | None:
+    """
+    Read `config.json` from a downloaded model directory on the QB2 and extract
+    structural architecture facts (supporting standard LLMs, multimodal `text_config`,
+    hybrid linear/sliding-window attention, and MoE routing).
+    """
+    if not local_path or not local_path.exists():
+        return None
+    cfg_path = local_path / "config.json"
+    if not cfg_path.exists():
+        return None
+
+    try:
+        raw = json.loads(cfg_path.read_text(errors="ignore"))
+        if not isinstance(raw, dict):
+            return None
+    except Exception:
+        return None
+
+    tc = raw.get("text_config") if isinstance(raw.get("text_config"), dict) else {}
+    vc = raw.get("vision_config") if isinstance(raw.get("vision_config"), dict) else None
+
+    def _get(key: str, default=None):
+        if key in tc and tc[key] is not None:
+            return tc[key]
+        return raw.get(key, default)
+
+    archs = raw.get("architectures") or []
+    arch_class = archs[0] if archs else str(_get("model_type", "Transformer"))
+    model_type = str(_get("model_type", raw.get("model_type", "llm")))
+
+    num_layers = int(
+        _get("num_hidden_layers")
+        or _get("n_layer")
+        or _get("num_layers")
+        or _get("depth")
+        or 0
+    )
+    hidden_size = int(_get("hidden_size") or _get("d_model") or _get("n_embd") or 0)
+    intermediate_size = int(_get("intermediate_size") or _get("ffn_dim") or 0)
+    num_heads = int(_get("num_attention_heads") or _get("n_head") or 0)
+    num_kv_heads = int(_get("num_key_value_heads") or num_heads or 0)
+    head_dim = int(
+        _get("head_dim")
+        or ((hidden_size // num_heads) if (num_heads and hidden_size) else 0)
+    )
+    vocab_size = int(_get("vocab_size") or 0)
+    native_context = int(
+        _get("max_position_embeddings")
+        or _get("max_seq_len")
+        or _get("seq_length")
+        or 0
+    )
+    dtype = str(_get("dtype") or _get("torch_dtype") or "bfloat16")
+
+    quant_cfg = _get("quantization_config") or raw.get("quantization_config")
+    quant_method = (
+        str(quant_cfg.get("quant_method"))
+        if isinstance(quant_cfg, dict) and quant_cfg.get("quant_method")
+        else None
+    )
+
+    num_experts = int(
+        _get("num_local_experts")
+        or _get("num_experts")
+        or _get("n_routed_experts")
+        or 0
+    )
+    experts_per_tok = int(
+        _get("num_experts_per_tok")
+        or _get("experts_per_token")
+        or _get("top_k_experts")
+        or 0
+    )
+
+    layer_types = _get("layer_types")
+    attn_pattern = "Dense Full-Attn"
+    kv_layers = num_layers
+    if isinstance(layer_types, list) and layer_types:
+        n_lin = sum(1 for x in layer_types if "linear" in str(x).lower())
+        n_swa = sum(1 for x in layer_types if "sliding" in str(x).lower())
+        n_full = sum(1 for x in layer_types if "full" in str(x).lower())
+        parts = []
+        if n_lin:
+            parts.append(f"{n_lin} Lin")
+        if n_swa:
+            parts.append(f"{n_swa} SWA")
+        if n_full:
+            parts.append(f"{n_full} Full")
+        if parts:
+            attn_pattern = "+".join(parts)
+        if n_lin and n_full:
+            kv_layers = n_full
+
+    if num_heads and num_kv_heads:
+        if num_heads == num_kv_heads:
+            gqa_label = "MHA"
+        elif num_heads % num_kv_heads == 0:
+            gqa_label = f"{num_heads // num_kv_heads}:1 GQA"
+        else:
+            gqa_label = "GQA"
+    else:
+        gqa_label = "N/A"
+
+    # Theoretical BF16 KV cache per token across full/sliding KV-bearing layers (2 bytes * K/V)
+    kv_kb_per_tok = (
+        (2.0 * kv_layers * num_kv_heads * head_dim * 2.0) / 1024.0
+        if (kv_layers and num_kv_heads and head_dim)
+        else 0.0
+    )
+
+    rope_theta = _get("rope_theta")
+    rope_params = _get("rope_parameters") or _get("rope_scaling")
+    if not rope_theta and isinstance(rope_params, dict):
+        rope_theta = rope_params.get("rope_theta")
+
+    # Build concise 1-line badge for Part 1 Catalog table
+    badge_parts = []
+    if num_layers:
+        if num_experts > 1:
+            moe_str = f"{num_experts}E/{experts_per_tok}A" if experts_per_tok else f"{num_experts}E"
+            if quant_method:
+                moe_str += f" {quant_method}"
+            badge_parts.append(f"{num_layers}L MoE ({moe_str})")
+        elif attn_pattern != "Dense Full-Attn":
+            badge_parts.append(f"{num_layers}L ({attn_pattern})")
+        else:
+            badge_parts.append(f"{num_layers}L Dense")
+    if hidden_size:
+        badge_parts.append(f"d={hidden_size}")
+    if num_heads and num_kv_heads:
+        badge_parts.append(f"{num_heads}Q/{num_kv_heads}KV ({gqa_label})")
+    if head_dim:
+        badge_parts.append(f"hd={head_dim}")
+    if vc is not None:
+        badge_parts.append("VLM")
+
+    return {
+        "arch_class": arch_class,
+        "model_type": model_type,
+        "num_layers": num_layers,
+        "attn_pattern": attn_pattern,
+        "hidden_size": hidden_size,
+        "intermediate_size": intermediate_size,
+        "num_heads": num_heads,
+        "num_kv_heads": num_kv_heads,
+        "gqa_label": gqa_label,
+        "head_dim": head_dim,
+        "vocab_size": vocab_size,
+        "native_context": native_context,
+        "dtype": dtype,
+        "quant_method": quant_method,
+        "num_experts": num_experts,
+        "experts_per_tok": experts_per_tok,
+        "has_vision": vc is not None,
+        "vision_layers": int((vc or {}).get("num_hidden_layers") or (vc or {}).get("depth") or 0),
+        "kv_kb_per_tok": kv_kb_per_tok,
+        "rope_theta": rope_theta,
+        "short_summary": " • ".join(badge_parts),
+    }
+
+
+def display_architecture_inspector(
+    downloaded_models: list[dict],
+    target_idx: int | None = None,
+) -> None:
+    """Display deep `config.json` architecture and shard facts for downloaded QB2 models."""
+    seen_paths: set[str] = set()
+    rows_to_show: list[tuple[int, dict]] = []
+
+    for idx, m in enumerate(downloaded_models, start=1):
+        if target_idx is not None and idx != target_idx:
+            continue
+        p_str = str(m.get("local_path", ""))
+        if target_idx is None and p_str in seen_paths:
+            continue
+        seen_paths.add(p_str)
+        rows_to_show.append((idx, m))
+
+    if not rows_to_show:
+        print("No matching downloaded model found for architecture inspection.")
+        return
+
+    if HAS_RICH:
+        t_arch = Table(
+            title="Step 2B — Local Model Architecture & Shard Inspector (Parsed from `config.json`)",
+            box=box.ROUNDED,
+            header_style="bold magenta",
+            show_lines=True,
+        )
+        t_arch.add_column("#", style="bold yellow", justify="right")
+        t_arch.add_column("Downloaded Model Repo", style="bold white")
+        t_arch.add_column("HF Architecture & Type", style="cyan")
+        t_arch.add_column("Layers & Attention Topology", style="green")
+        t_arch.add_column("Dimensions (Hidden / FFN / MoE)", style="white")
+        t_arch.add_column("Heads (Q / KV / HeadDim)", style="magenta")
+        t_arch.add_column("Vocab & Native Ctx", style="yellow", justify="right")
+        t_arch.add_column("Dtype, KV/Tok & Shards", style="cyan", justify="right")
+
+        for idx, m in rows_to_show:
+            arch = m.get("arch_info") or inspect_model_architecture(m["local_path"])
+            if not arch:
+                t_arch.add_row(
+                    str(idx),
+                    m["hf_repo"],
+                    "No config.json",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    f"{m['actual_size_gb']:.1f} GB ({m['n_shards']} shards)",
+                )
+                continue
+
+            vlm_tag = f"\n[bold yellow]+ Vision ({arch['vision_layers']}L)[/bold yellow]" if arch["has_vision"] else ""
+            moe_line = (
+                f"\n[bold green]MoE: {arch['num_experts']} experts (top-{arch['experts_per_tok']} active)[/bold green]"
+                if arch["num_experts"] > 1
+                else ""
+            )
+            dtype_str = (
+                f"{arch['dtype']} ({arch['quant_method']})"
+                if arch["quant_method"]
+                else arch["dtype"]
+            )
+            ctx_str = f"{arch['native_context']:,}" if arch["native_context"] else "N/A"
+            vocab_str = f"{arch['vocab_size']:,}" if arch["vocab_size"] else "N/A"
+
+            t_arch.add_row(
+                str(idx),
+                f"{m['hf_repo']}\n[dim]{m['local_path']}[/dim]",
+                f"{arch['arch_class']}\n[dim]type: {arch['model_type']}[/dim]{vlm_tag}",
+                f"{arch['num_layers']} layers\n[dim]{arch['attn_pattern']}[/dim]",
+                f"d_model = {arch['hidden_size']:,}\nffn_dim = {arch['intermediate_size']:,}{moe_line}",
+                f"{arch['num_heads']} Q / {arch['num_kv_heads']} KV\n({arch['gqa_label']}, hd={arch['head_dim']})",
+                f"Vocab: {vocab_str}\nCtx: {ctx_str}",
+                f"{dtype_str}\nKV: {arch['kv_kb_per_tok']:.1f} KB/tok\n{m['actual_size_gb']:.1f} GB ({m['n_shards']} shards)",
+            )
+        console.print(t_arch)
+    else:
+        print("\n=== Local Model Architecture & Shard Inspector (config.json) ===")
+        for idx, m in rows_to_show:
+            arch = m.get("arch_info") or inspect_model_architecture(m["local_path"])
+            if arch:
+                print(
+                    f"  [{idx}] {m['hf_repo']} | {arch['arch_class']} | {arch['short_summary']} | "
+                    f"Vocab: {arch['vocab_size']:,} | Native Ctx: {arch['native_context']:,} | "
+                    f"KV: {arch['kv_kb_per_tok']:.1f} KB/tok | {m['actual_size_gb']:.1f} GB ({m['n_shards']} shards)"
+                )
+
+
+# ==============================================================================
+# ITEM 2: Persistent Load-Time Store & TT-Metal Cache Warm/Cold Detector
+# ==============================================================================
+DEFAULT_LOAD_TIMINGS = {
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B": {"warm_samples_sec": [86, 119, 88], "cold_samples_sec": [418]},
+    "Qwen/Qwen3-32B": {"warm_samples_sec": [86, 119, 88], "cold_samples_sec": [418]},
+    "Qwen/QwQ-32B": {"warm_samples_sec": [92], "cold_samples_sec": [420]},
+    "Qwen/Qwen2.5-Coder-32B-Instruct": {"warm_samples_sec": [92], "cold_samples_sec": [420]},
+    "Qwen/Qwen3.8-27B": {"warm_samples_sec": [145], "cold_samples_sec": [405]},
+    "openai/gpt-oss-120b": {"warm_samples_sec": [210], "cold_samples_sec": [1713]},
+    "meta-llama/Llama-3.1-70B-Instruct": {"warm_samples_sec": [621], "cold_samples_sec": [1367]},
+    "meta-llama/Llama-3.1-8B-Instruct": {"warm_samples_sec": [255, 256], "cold_samples_sec": [346]},
+}
+
+
+def load_timings_store() -> dict:
+    """Load persistent warm/cold startup timing samples from `load_timings_cache.json`."""
+    store = {"schema_version": 1, "models": dict(DEFAULT_LOAD_TIMINGS)}
+    if LOAD_TIMINGS_CACHE_FILE.exists():
+        try:
+            data = json.loads(LOAD_TIMINGS_CACHE_FILE.read_text(errors="ignore"))
+            if isinstance(data, dict) and isinstance(data.get("models"), dict):
+                for k, v in data["models"].items():
+                    store["models"][k] = v
+        except Exception:
+            pass
+    return store
+
+
+def record_model_load_timing(hf_repo: str, duration_sec: int, is_warm: bool) -> None:
+    """Append a newly observed warm or cold bring-up duration to `load_timings_cache.json`."""
+    if duration_sec < 10:
+        return
+    store = load_timings_store()
+    models_map = store.setdefault("models", {})
+    rec = models_map.setdefault(
+        hf_repo,
+        {"warm_samples_sec": [], "cold_samples_sec": []},
+    )
+    key = "warm_samples_sec" if is_warm else "cold_samples_sec"
+    samples = list(rec.get(key) or [])
+    samples.append(int(duration_sec))
+    rec[key] = samples[-10:]
+    rec["last_mode"] = "warm" if is_warm else "cold"
+    rec["last_duration_sec"] = int(duration_sec)
+    rec["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        SCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+        LOAD_TIMINGS_CACHE_FILE.write_text(json.dumps(store, indent=2) + "\n")
+    except Exception:
+        pass
+
+
+def inspect_tt_cache_volumes_map() -> dict[str, float]:
+    """
+    Return a mapping of `volume_name -> size_gb` for all Docker `volume_id_*` volumes
+    and host `/home/ttuser/data/tt-cache/volume_id_*` directories on the QB2.
+    """
+    vol_sizes: dict[str, float] = {}
+    rc, out, _ = run_cmd(["docker", "system", "df", "-v"], timeout=10.0)
+    if rc == 0 and out:
+        in_vols = False
+        for line in out.splitlines():
+            s = line.strip()
+            if s.startswith("VOLUME NAME"):
+                in_vols = True
+                continue
+            if in_vols:
+                if not s or s.startswith("Build cache"):
+                    in_vols = False
+                    continue
+                parts = s.split()
+                if len(parts) >= 3:
+                    vname = parts[0]
+                    vsize_str = parts[-1]
+                    vol_sizes[vname] = _parse_size_to_gb(vsize_str)
+
+    if TT_CACHE_DIR.exists():
+        for d in TT_CACHE_DIR.iterdir():
+            if d.is_dir() and d.name.startswith("volume_id_"):
+                rc_du, du_out, _ = run_cmd(["du", "-sk", str(d)], timeout=5.0)
+                if rc_du == 0 and du_out:
+                    kb_str = du_out.split()[0]
+                    if kb_str.isdigit():
+                        gb_val = int(kb_str) / (1024.0**2)
+                        vol_sizes[d.name] = max(vol_sizes.get(d.name, 0.0), gb_val)
+
+    return vol_sizes
+
+
+def annotate_model_cache_and_load_estimate(
+    entry: dict,
+    timings_store: dict,
+    vol_sizes: dict[str, float],
+) -> None:
+    """
+    Annotate `entry` in-place with:
+      • `cache_warm`: True if a pre-compiled TT-Metal tensor cache (`>= 0.1 GB`) exists for its spec
+      • `cache_vol_name` & `cache_vol_gb`
+      • `warm_est_sec`, `cold_est_sec`, `est_load_sec`
+      • `cache_badge`: Human-readable status for catalog tables
+    """
+    spec_model = entry.get("tt_spec_model", "")
+    impl_name = entry.get("impl", "tt_transformers")
+    expected_vol = f"volume_id_{impl_name}-{spec_model}"
+
+    matched_vol = expected_vol
+    matched_gb = vol_sizes.get(expected_vol, 0.0)
+
+    if matched_gb < 0.1:
+        for vname, vgb in vol_sizes.items():
+            if vname == expected_vol or (
+                spec_model.lower() in vname.lower() and impl_name.lower() in vname.lower()
+            ):
+                if vgb > matched_gb:
+                    matched_vol = vname
+                    matched_gb = vgb
+
+    cache_warm = matched_gb >= 0.1
+
+    models_time_map = timings_store.get("models", {})
+    rec = models_time_map.get(entry["hf_repo"])
+    if not rec and spec_model == "Qwen3-32B":
+        rec = models_time_map.get("Qwen/Qwen3-32B")
+
+    params_b = float(entry.get("param_count") or 30.0)
+    default_warm = int(max(85.0, min(650.0, params_b * 4.2)))
+    default_cold = int(max(320.0, min(1800.0, params_b * 14.5)))
+
+    warm_samples = (rec or {}).get("warm_samples_sec") or []
+    cold_samples = (rec or {}).get("cold_samples_sec") or []
+
+    has_kernel_vol = matched_vol in vol_sizes and matched_gb > 0.0 and bool(warm_samples)
+    cache_warm = (matched_gb >= 0.1) or has_kernel_vol
+
+    warm_est_sec = int(round(statistics.mean(warm_samples))) if warm_samples else default_warm
+    cold_est_sec = int(round(statistics.mean(cold_samples))) if cold_samples else default_cold
+    est_load_sec = warm_est_sec if cache_warm else cold_est_sec
+
+    entry["cache_warm"] = cache_warm
+    entry["cache_vol_name"] = matched_vol
+    entry["cache_vol_gb"] = matched_gb
+    entry["warm_est_sec"] = warm_est_sec
+    entry["cold_est_sec"] = cold_est_sec
+    entry["est_load_sec"] = est_load_sec
+
+    if matched_gb >= 0.1:
+        entry["cache_badge"] = (
+            f"[bold green]Warm Cache ({matched_gb:.1f} GB)[/bold green] • ~{_format_duration(warm_est_sec)} load"
+        )
+        entry["cache_badge_plain"] = (
+            f"Warm Cache ({matched_gb:.1f} GB, ~{_format_duration(warm_est_sec)} load)"
+        )
+    elif has_kernel_vol:
+        entry["cache_badge"] = (
+            f"[bold green]Warm Kernel Cache[/bold green] • ~{_format_duration(warm_est_sec)} load (~{_format_duration(cold_est_sec)} cold)"
+        )
+        entry["cache_badge_plain"] = (
+            f"Warm Kernel Cache (~{_format_duration(warm_est_sec)} load)"
+        )
+    else:
+        entry["cache_badge"] = (
+            f"[yellow]Cold Compile[/yellow] • ~{_format_duration(cold_est_sec)} 1st load (~{_format_duration(warm_est_sec)} warm)"
+        )
+        entry["cache_badge_plain"] = (
+            f"Cold Compile (~{_format_duration(cold_est_sec)} 1st load)"
+        )
+
+
+# ==============================================================================
+# ITEM 6: Docker Image & TT-Metal Cache Volume Inspector / Cleaner
+# ==============================================================================
+def inspect_docker_and_cache_storage(
+    state: dict,
+    catalog_entries: list[dict] | None = None,
+) -> dict:
+    """
+    Inspect all local Docker images, Docker `volume_id_*` TT-Metal cache volumes,
+    host `/home/ttuser/data/tt-cache` directories, and Docker build cache on the QB2.
+    """
+    active_images = {c.get("image", "") for c in (state.get("containers") or [])}
+    active_image_ids = {c.get("id", "")[:12] for c in (state.get("containers") or [])}
+
+    images: list[dict] = []
+    volumes: list[dict] = []
+    host_caches: list[dict] = []
+    build_cache_gb = 0.0
+
+    rc, df_out, _ = run_cmd(["docker", "system", "df", "-v"], timeout=12.0)
+    if rc == 0 and df_out:
+        section = None
+        for raw_line in df_out.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("REPOSITORY") and "IMAGE ID" in line:
+                section = "images"
+                continue
+            if line.startswith("CONTAINER ID") and "IMAGE" in line:
+                section = "containers"
+                continue
+            if line.startswith("VOLUME NAME") and "SIZE" in line:
+                section = "volumes"
+                continue
+            if line.startswith("Build cache usage:"):
+                section = "build_cache"
+                m_bc = re.search(r"Build cache usage:\s*([^\s]+)", line)
+                if m_bc:
+                    build_cache_gb = _parse_size_to_gb(m_bc.group(1))
+                continue
+            if line.startswith("CACHE ID"):
+                continue
+
+            if section == "images":
+                # Parse columns: REPOSITORY TAG IMAGE_ID CREATED SIZE SHARED_SIZE UNIQUE_SIZE CONTAINERS
+                m_img = re.match(
+                    r"^(\S+)\s+(\S+)\s+([0-9a-f]{12})\s+(.+?)\s+(\d+(?:\.\d+)?(?:B|kB|KB|MB|GB|TB))\s+"
+                    r"(\d+(?:\.\d+)?(?:B|kB|KB|MB|GB|TB))\s+(\d+(?:\.\d+)?(?:B|kB|KB|MB|GB|TB))\s+(\d+)$",
+                    line,
+                )
+                if m_img:
+                    repo, tag, img_id, created, size_s, shared_s, uniq_s, c_cnt = m_img.groups()
+                    full_ref = f"{repo}:{tag}" if repo != "<none>" else "<none>:<none>"
+                    con_count = int(c_cnt)
+                    is_active = (full_ref in active_images) or (img_id in active_image_ids) or (con_count > 0 and "vllm-tt-metal" in repo)
+                    is_pr55630 = full_ref == PATCHED_QWEN3_IMAGE or "pr55630" in tag
+                    is_dangling = repo == "<none>" and tag == "<none>" and con_count == 0
+
+                    if is_active and "vllm-tt-metal" in repo:
+                        role = "★ ACTIVE MODEL SERVER"
+                        protected = True
+                    elif is_pr55630:
+                        role = "★ PATCHED (PR #55630 Fix)"
+                        protected = True
+                    elif con_count > 0:
+                        role = f"IN USE ({con_count} container)"
+                        protected = True
+                    elif is_dangling:
+                        role = "DANGLING (<none> — Safe to Prune)"
+                        protected = False
+                    elif "vllm-tt-metal" in repo:
+                        ver_m = re.match(r"^(\d+\.\d+\.\d+)", tag)
+                        ver_str = f"v{ver_m.group(1)}" if ver_m else tag
+                        role = f"TT-Inference Engine ({ver_str})"
+                        protected = False
+                    elif "tt-media-inference-server" in repo:
+                        role = "TT-Media Server Image"
+                        protected = False
+                    elif "tt-studio" in repo:
+                        role = "TT-Studio Component"
+                        protected = True
+                    else:
+                        role = "Base / Support Image"
+                        protected = con_count > 0
+
+                    images.append(
+                        {
+                            "repo": repo,
+                            "tag": tag,
+                            "full_ref": full_ref,
+                            "id": img_id,
+                            "created": created.strip(),
+                            "size_str": size_s,
+                            "size_gb": _parse_size_to_gb(size_s),
+                            "unique_str": uniq_s,
+                            "unique_gb": _parse_size_to_gb(uniq_s),
+                            "containers": con_count,
+                            "role": role,
+                            "protected": protected,
+                            "dangling": is_dangling,
+                        }
+                    )
+            elif section == "volumes":
+                parts = line.split()
+                if len(parts) >= 3:
+                    vname, links_s, vsize_s = parts[0], parts[1], parts[2]
+                    links = int(links_s) if links_s.isdigit() else 0
+                    vgb = _parse_size_to_gb(vsize_s)
+                    model_hint = vname.replace("volume_id_", "")
+                    volumes.append(
+                        {
+                            "name": vname,
+                            "type": "Docker Volume",
+                            "links": links,
+                            "size_str": vsize_s,
+                            "size_gb": vgb,
+                            "model_hint": model_hint,
+                            "protected": links > 0,
+                        }
+                    )
+
+    if TT_CACHE_DIR.exists():
+        for d in sorted(TT_CACHE_DIR.iterdir()):
+            if not d.is_dir():
+                continue
+            rc_du, du_out, _ = run_cmd(["du", "-sh", str(d)], timeout=5.0)
+            size_s = du_out.split()[0] if (rc_du == 0 and du_out) else "0B"
+            size_gb = _parse_size_to_gb(size_s)
+            has_w = (d / "weights").exists() and any((d / "weights").rglob("*.safetensors"))
+            host_caches.append(
+                {
+                    "name": d.name,
+                    "path": str(d),
+                    "type": "Host TT-Cache Dir",
+                    "size_str": size_s,
+                    "size_gb": size_gb,
+                    "has_weights": has_w,
+                    "protected": has_w,
+                }
+            )
+
+    dangling_gb = sum(img["unique_gb"] for img in images if img["dangling"])
+    empty_vols = [v["name"] for v in volumes if v["size_gb"] == 0.0 and v["links"] == 0 and v["name"].startswith("volume_id_")]
+    total_vol_gb = sum(v["size_gb"] for v in volumes)
+    total_host_cache_gb = sum(hc["size_gb"] for hc in host_caches)
+
+    return {
+        "images": images,
+        "volumes": volumes,
+        "host_caches": host_caches,
+        "build_cache_gb": build_cache_gb,
+        "dangling_gb": dangling_gb,
+        "reclaimable_gb": build_cache_gb + dangling_gb,
+        "empty_volumes": empty_vols,
+        "total_vol_gb": total_vol_gb,
+        "total_host_cache_gb": total_host_cache_gb,
+    }
+
+
+def display_docker_and_cache_inspector(storage: dict) -> None:
+    """Render full tables of local Docker images, TT-Metal cache volumes, and host cache directories."""
+    images = storage["images"]
+    volumes = storage["volumes"]
+    host_caches = storage["host_caches"]
+
+    if HAS_RICH:
+        summary_lines = [
+            f"[bold cyan]Local Docker Images:[/bold cyan]         [white]{len(images)} images[/white] "
+            f"([yellow]{sum(1 for i in images if 'tenstorrent' in i['repo'])} Tenstorrent inference/studio images[/yellow])",
+            f"[bold cyan]Docker TT-Metal Volumes:[/bold cyan]     [white]{len(volumes)} volumes[/white] "
+            f"([bold green]{storage['total_vol_gb']:.1f} GB[/bold green] of pre-compiled Blackhole `p300x2` tensor caches)",
+            f"[bold cyan]Host `/home/ttuser/data/tt-cache`:[/bold cyan] [white]{len(host_caches)} dirs[/white] "
+            f"([bold green]{storage['total_host_cache_gb']:.1f} GB[/bold green] including `Qwen3-32B` weights & caches)",
+            f"[bold cyan]Safe Reclaimable Space:[/bold cyan]      [bold yellow]{storage['reclaimable_gb']:.2f} GB[/bold yellow] "
+            f"({storage['dangling_gb']:.2f} GB dangling `<none>` images + {storage['build_cache_gb']:.2f} GB Docker build cache + {len(storage['empty_volumes'])} empty 0B volumes)",
+        ]
+        console.print(
+            Panel(
+                "\n".join(summary_lines),
+                title="[bold cyan]Step 2C — QB2 Docker Image & TT-Metal Cache Volume Inspector[/bold cyan]",
+                border_style="cyan",
+            )
+        )
+
+        t_img = Table(
+            title=f"1. Local Docker Images on QB2 ({len(images)} Total)",
+            box=box.ROUNDED,
+            header_style="bold cyan",
+            show_lines=True,
+        )
+        t_img.add_column("#", style="bold yellow", justify="right")
+        t_img.add_column("Repository & Tag", style="bold white")
+        t_img.add_column("Image ID", style="cyan")
+        t_img.add_column("Created", style="dim")
+        t_img.add_column("Total Size", style="magenta", justify="right")
+        t_img.add_column("Unique Size", style="yellow", justify="right")
+        t_img.add_column("Role / Status", style="green")
+
+        for idx, img in enumerate(images, start=1):
+            role_style = (
+                f"[bold bright_green]{img['role']}[/bold bright_green]"
+                if img["role"].startswith("★")
+                else (
+                    f"[bold yellow]{img['role']}[/bold yellow]"
+                    if img["dangling"]
+                    else img["role"]
+                )
+            )
+            t_img.add_row(
+                str(idx),
+                f"{img['repo']}\n[bold cyan]:{img['tag']}[/bold cyan]",
+                img["id"],
+                img["created"],
+                img["size_str"],
+                img["unique_str"],
+                role_style,
+            )
+        console.print(t_img)
+
+        t_vol = Table(
+            title="2. Tenstorrent TT-Metal Cache Volumes & Host Cache Directories",
+            box=box.ROUNDED,
+            header_style="bold green",
+            show_lines=True,
+        )
+        t_vol.add_column("#", style="bold yellow", justify="right")
+        t_vol.add_column("Volume / Cache Name", style="bold white")
+        t_vol.add_column("Storage Type", style="cyan")
+        t_vol.add_column("Size on Disk", style="magenta", justify="right")
+        t_vol.add_column("Associated Spec / Notes", style="green")
+
+        for idx, v in enumerate(volumes, start=1):
+            status_note = (
+                f"[bold green]Warm Tensor Cache ({v['model_hint']})[/bold green]"
+                if v["size_gb"] >= 0.1
+                else (
+                    "[yellow]Empty / Uncompiled (0B — Safe to Prune)[/yellow]"
+                    if v["size_gb"] == 0.0
+                    else f"Partial / Metadata ({v['model_hint']})"
+                )
+            )
+            if v["links"] > 0:
+                status_note += f" [bold cyan](Mounted by {v['links']} container)[/bold cyan]"
+            t_vol.add_row(
+                f"V{idx}",
+                v["name"],
+                v["type"],
+                v["size_str"],
+                status_note,
+            )
+
+        for idx, hc in enumerate(host_caches, start=1):
+            hc_note = (
+                "[bold green]Contains Model `.safetensors` Weights + TT-Cache (Protected)[/bold green]"
+                if hc["has_weights"]
+                else "[dim]Host TT-Cache Directory[/dim]"
+            )
+            t_vol.add_row(
+                f"H{idx}",
+                f"{hc['name']}\n[dim]{hc['path']}[/dim]",
+                hc["type"],
+                hc["size_str"],
+                hc_note,
+            )
+        console.print(t_vol)
+    else:
+        print("\n=== QB2 Docker Images & TT-Metal Cache Volumes ===")
+        for idx, img in enumerate(images, start=1):
+            print(
+                f"  [Image {idx}] {img['full_ref']} ({img['id']}) | Size: {img['size_str']} (Unique: {img['unique_str']}) | {img['role']}"
+            )
+        for idx, v in enumerate(volumes, start=1):
+            print(f"  [Volume V{idx}] {v['name']} | Size: {v['size_str']} | Links: {v['links']}")
+
+
+def prune_docker_and_caches(storage: dict) -> None:
+    """Safely prune dangling `<none>` Docker images, unused Docker build cache, and 0-byte `volume_id_*` volumes."""
+    if HAS_RICH:
+        console.print(
+            Panel(
+                "[bold yellow]Running safe cleanup of dangling `<none>` Docker images, unused Docker build cache, and empty 0B TT-Metal volumes...[/bold yellow]\n"
+                "[dim](All tagged images, active containers, PR #55630 patched image, and populated TT-Metal caches are untouched.)[/dim]",
+                title="[bold yellow]Safe Docker & Cache Prune[/bold yellow]",
+                border_style="yellow",
+            )
+        )
+    else:
+        print("\n=== Running safe Docker & empty cache prune ===")
+
+    rc1, out1, _ = run_cmd(["docker", "image", "prune", "-f"], timeout=30.0)
+    if rc1 == 0 and out1:
+        print(f"  • docker image prune: {out1.splitlines()[-1]}")
+
+    rc2, out2, _ = run_cmd(["docker", "builder", "prune", "-f"], timeout=60.0)
+    if rc2 == 0 and out2:
+        print(f"  • docker builder prune: {out2.splitlines()[-1]}")
+
+    for vname in storage.get("empty_volumes", []):
+        rc_v, _, _ = run_cmd(["docker", "volume", "rm", vname], timeout=10.0)
+        if rc_v == 0:
+            print(f"  • Removed empty 0B volume: {vname}")
+
+    if HAS_RICH:
+        console.print("[bold green]✓ Safe Docker & cache prune complete.[/bold green]")
+    else:
+        print("✓ Safe Docker & cache prune complete.")
+
+
+def run_storage_cleanup_menu(state: dict, catalog_entries: list[dict]) -> None:
+    """Interactive inspector and cleanup menu for Docker images and TT-Metal cache volumes."""
+    storage = inspect_docker_and_cache_storage(state, catalog_entries)
+    display_docker_and_cache_inspector(storage)
+
+    while True:
+        try:
+            if HAS_RICH:
+                raw = console.input(
+                    "\n[bold cyan]Storage Action — 'p' safe prune (dangling images + build cache + 0B vols), "
+                    "'rmi <#>' remove unused image #, 'rmv <V#>' remove volume, or Enter to return: [/bold cyan]"
+                ).strip()
+            else:
+                raw = input(
+                    "\nStorage Action ('p' safe prune, 'rmi <#>' remove image, 'rmv <V#>' remove volume, Enter to return): "
+                ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+
+        if not raw or raw.lower() in ("q", "quit", "exit", "b", "back"):
+            return
+
+        if raw.lower() in ("p", "prune"):
+            prune_docker_and_caches(storage)
+            storage = inspect_docker_and_cache_storage(state, catalog_entries)
+            display_docker_and_cache_inspector(storage)
+            continue
+
+        m_rmi = re.match(r"^rmi\s+(\d+)$", raw, flags=re.I)
+        if m_rmi:
+            idx = int(m_rmi.group(1))
+            images = storage["images"]
+            if not (1 <= idx <= len(images)):
+                print(f"Image #{idx} out of range (1..{len(images)}).")
+                continue
+            target_img = images[idx - 1]
+            if target_img["protected"]:
+                print(
+                    f"✗ Refusing to remove protected image #{idx} ({target_img['full_ref']} — {target_img['role']})."
+                )
+                continue
+            ref_to_rm = target_img["id"] if target_img["dangling"] else target_img["full_ref"]
+            rc, out, err = run_cmd(["docker", "rmi", ref_to_rm], timeout=30.0)
+            if rc == 0:
+                print(f"✓ Removed Docker image {ref_to_rm}.")
+            else:
+                print(f"✗ docker rmi failed: {err or out}")
+            storage = inspect_docker_and_cache_storage(state, catalog_entries)
+            display_docker_and_cache_inspector(storage)
+            continue
+
+        m_rmv = re.match(r"^rmv\s+[vV]?(\d+)$", raw, flags=re.I)
+        if m_rmv:
+            v_idx = int(m_rmv.group(1))
+            volumes = storage["volumes"]
+            if not (1 <= v_idx <= len(volumes)):
+                print(f"Volume V{v_idx} out of range (1..{len(volumes)}).")
+                continue
+            target_vol = volumes[v_idx - 1]
+            if target_vol["protected"]:
+                print(
+                    f"✗ Refusing to remove volume {target_vol['name']} because it is mounted by an active container."
+                )
+                continue
+            rc, out, err = run_cmd(["docker", "volume", "rm", target_vol["name"]], timeout=20.0)
+            if rc == 0:
+                print(f"✓ Removed Docker volume {target_vol['name']} ({target_vol['size_str']}).")
+            else:
+                print(f"✗ docker volume rm failed: {err or out}")
+            storage = inspect_docker_and_cache_storage(state, catalog_entries)
+            display_docker_and_cache_inspector(storage)
+            continue
+
+        print("Unrecognized command. Use 'p', 'rmi <#>', 'rmv <V#>', or press Enter to return.")
+
+
 def partition_models(
     include_dev: bool = False,
     refresh_ranks: bool = False,
 ) -> tuple[list[dict], list[dict]]:
     """
     Partition the live catalog into (1) Already Downloaded on QB2 and (2) Available to Pull,
-    annotated and sorted highest-to-lowest by Hugging Face Frontier Proximity %.
+    annotated with Hugging Face Frontier Proximity %, local `config.json` architecture facts,
+    warm/cold TT-Metal tensor cache state, and persistent bring-up time estimates.
     """
     downloaded: list[dict] = []
     available_to_pull: list[dict] = []
@@ -1671,6 +2517,8 @@ def partition_models(
     # Fetch/load Hugging Face Frontier Proximity scores for all unique hf_repos
     all_repos = list(dict.fromkeys(m["hf_repo"] for m in (downloaded + available_to_pull)))
     rank_map = get_or_update_frontier_rankings(all_repos, force_refresh=refresh_ranks)
+    timings_store = load_timings_store()
+    vol_sizes = inspect_tt_cache_volumes_map()
 
     for m in downloaded + available_to_pull:
         r_info = rank_map.get(
@@ -1681,6 +2529,18 @@ def partition_models(
         m["frontier_tier"] = str(r_info.get("tier", "B Tier"))
         m["frontier_source"] = str(r_info.get("source", "HF Metadata"))
         m["hf_created"] = str(r_info.get("created", "unknown"))
+
+        # Annotate TT-Metal warm/cold cache status and estimated load duration (Item 2)
+        annotate_model_cache_and_load_estimate(m, timings_store, vol_sizes)
+
+        # Annotate local `config.json` architecture facts for downloaded models (Item 3)
+        if m.get("downloaded"):
+            arch_info = inspect_model_architecture(m["local_path"])
+            m["arch_info"] = arch_info
+            m["arch_summary"] = arch_info["short_summary"] if arch_info else ""
+        else:
+            m["arch_info"] = None
+            m["arch_summary"] = ""
 
     # Sort both lists by:
     #   1) Frontier Proximity Score (descending)
@@ -1739,6 +2599,7 @@ def display_storage_and_catalog(
     """Render storage locations, Part 1 (Downloaded), and Part 2 (Available to Pull), sorted by Frontier Proximity."""
     combined = downloaded_models + available_to_pull
     repo_ver = get_tt_inference_repo_version()
+    storage_summary = inspect_docker_and_cache_storage(state, combined)
     mode_label = (
         "Production (`prod/llm.yaml`) + Dev (`dev/llm.yaml`, `dev/vlm.yaml`)"
         if include_dev
@@ -1749,10 +2610,11 @@ def display_storage_and_catalog(
         storage_lines = [
             f"[bold cyan]TT-Inference-Server Repo:[/bold cyan]    [bold white]{repo_ver}[/bold white] (`/home/ttuser/.local/lib/tt-inference-server`)",
             f"[bold cyan]Active Catalog Mode:[/bold cyan]         [yellow]{mode_label}[/yellow]",
-            f"[bold cyan]Catalog Ordering:[/bold cyan]            [bold green]Sorted by Frontier Proximity %[/bold green] (Extracted from Hugging Face model cards & metadata; cache: `frontier_rankings_cache.json`)",
-            f"[bold cyan]1. Primary Host Weights:[/bold cyan]     [white]/home/ttuser/models[/white] (`Qwen3.8-27B`, `gemma-4-31B-it`, `DeepSeek-R1-Distill-Qwen-32B`, `Llama-3.1-70B/8B`)",
-            f"[bold cyan]2. TT-Cache Host Weights:[/bold cyan]    [white]/home/ttuser/data/tt-cache/volume_id_tt_transformers-Qwen3-32B-vqb2_launch/weights[/white] (`Qwen/Qwen3-32B`)",
-            f"[bold cyan]3. Docker TT-Metal Volumes:[/bold cyan]  [white]/var/lib/docker/volumes/volume_id_tt_transformers-*[/white] (Pre-compiled Blackhole `p300x2` tensor caches)",
+            f"[bold cyan]Catalog Ordering:[/bold cyan]            [bold green]Sorted by Frontier Proximity %[/bold green] (HF cache: `frontier_rankings_cache.json` | Load timings: `load_timings_cache.json`)",
+            f"[bold cyan]1. Primary Host Weights:[/bold cyan]     [white]/home/ttuser/models[/white] (`Qwen3.8-27B`, `gpt-oss-120b`, `gemma-4-31B-it`, `DeepSeek-R1-Distill-Qwen-32B`, `Llama-3.1-70B/8B`)",
+            f"[bold cyan]2. TT-Cache Host Weights:[/bold cyan]    [white]/home/ttuser/data/tt-cache/volume_id_tt_transformers-Qwen3-32B-vqb2_launch/weights[/white] (`Qwen/Qwen3-32B`, {storage_summary['total_host_cache_gb']:.1f} GB total)",
+            f"[bold cyan]3. Docker Images & Volumes:[/bold cyan]  [white]{len(storage_summary['images'])} images, {len(storage_summary['volumes'])} TT-Metal cache volumes ({storage_summary['total_vol_gb']:.1f} GB)[/white] "
+            f"[dim](Reclaimable build/dangling cache: {storage_summary['reclaimable_gb']:.1f} GB — press `'i'` or `--images`)[/dim]",
         ]
         console.print(
             Panel(
@@ -1769,10 +2631,10 @@ def display_storage_and_catalog(
             show_lines=True,
         )
         t_down.add_column("#", style="bold yellow", justify="right")
-        t_down.add_column("Model / Weights", style="bold white")
+        t_down.add_column("Model / Weights & Local `config.json` Architecture", style="bold white")
         t_down.add_column("Frontier Proximity", style="bold green", justify="right")
         t_down.add_column("vLLM / TT Spec & Impl", style="cyan")
-        t_down.add_column("Disk & Speed / Ctx", style="magenta")
+        t_down.add_column("Disk, TT-Cache & Est. Load", style="magenta")
         t_down.add_column("Local Weights Folder on QB2", style="white")
 
         for idx, m in enumerate(downloaded_models, start=1):
@@ -1786,12 +2648,18 @@ def display_storage_and_catalog(
                 if is_entry_currently_running(m, state)
                 else ""
             )
+            arch_line = (
+                f"\n[cyan]Arch: {m['arch_summary']}[/cyan]"
+                if m.get("arch_summary")
+                else ""
+            )
             t_down.add_row(
                 str(idx),
-                f"{m['display_name']}{running_badge}\n[dim]{m['notes']}[/dim]",
+                f"{m['display_name']}{running_badge}{arch_line}\n[dim]{m['notes']}[/dim]",
                 f"{m['frontier_score']:.1f}% ({m['frontier_tier']})\n[dim]{m['frontier_source']}[/dim]",
                 f"--model {m['tt_spec_model']}\n--tt-device {m['tt_device']}\nimpl: {m['impl']}",
-                f"{m['actual_size_gb']:.1f} GB ({m['n_shards']} shards)\n{m['est_speed']} | {ctx_fmt} ctx (x{m['max_concurrency']})",
+                f"{m['actual_size_gb']:.1f} GB ({m['n_shards']} shards) | {m['est_speed']}\n"
+                f"{ctx_fmt} ctx (x{m['max_concurrency']})\n{m.get('cache_badge', '')}",
                 str(m["local_path"]),
             )
         console.print(t_down)
@@ -1806,7 +2674,7 @@ def display_storage_and_catalog(
         t_avail.add_column("Hugging Face Model Repo", style="bold white")
         t_avail.add_column("Frontier Proximity", style="bold green", justify="right")
         t_avail.add_column("vLLM / TT Spec & Impl", style="cyan")
-        t_avail.add_column("Download & Speed / Ctx", style="magenta")
+        t_avail.add_column("Download, TT-Cache & Est. Load", style="magenta")
         t_avail.add_column("Catalog Status & Target Folder", style="dim")
 
         start_idx = len(downloaded_models) + 1
@@ -1822,7 +2690,8 @@ def display_storage_and_catalog(
                 f"{m['display_name']}\n[dim]{m['notes']}[/dim]",
                 f"{m['frontier_score']:.1f}% ({m['frontier_tier']})\n[dim]{m['frontier_source']}[/dim]",
                 f"--model {m['tt_spec_model']}\n--tt-device {m['tt_device']}\nimpl: {m['impl']}{dev_flag_note}",
-                f"{m['est_size_gb']}\n{m['est_speed']} | {ctx_fmt} ctx (x{m['max_concurrency']})",
+                f"{m['est_size_gb']} | {m['est_speed']}\n"
+                f"{ctx_fmt} ctx (x{m['max_concurrency']})\n{m.get('cache_badge', '')}",
                 f"{m['status']} (v{m['version']})\nTarget: {m['local_path']}",
             )
         console.print(t_avail)
@@ -1831,16 +2700,19 @@ def display_storage_and_catalog(
         print("=== Part 1: Models Already Downloaded on QB2 (Ranked by Frontier Proximity) ===")
         for idx, m in enumerate(downloaded_models, start=1):
             run_tag = " [RUNNING]" if is_entry_currently_running(m, state) else ""
+            arch_s = f" | Arch: {m['arch_summary']}" if m.get("arch_summary") else ""
             print(
                 f"  [{idx}] {m['display_name']}{run_tag} | Frontier: {m['frontier_score']:.1f}% ({m['frontier_tier']}) | "
-                f"Spec: {m['tt_spec_model']} ({m['tt_device']}, {m['impl']}) | {m['actual_size_gb']:.1f} GB | Path: {m['local_path']}"
+                f"Spec: {m['tt_spec_model']} ({m['tt_device']}, {m['impl']}) | {m['actual_size_gb']:.1f} GB | "
+                f"{m.get('cache_badge_plain', '')}{arch_s} | Path: {m['local_path']}"
             )
         print("\n=== Part 2: Models Supported on QB2 (Ranked by Frontier Proximity — Auto-Pulls from HF) ===")
         start_idx = len(downloaded_models) + 1
         for idx, m in enumerate(available_to_pull, start=start_idx):
             print(
                 f"  [{idx}] {m['display_name']} | Frontier: {m['frontier_score']:.1f}% ({m['frontier_tier']}) | "
-                f"Spec: {m['tt_spec_model']} ({m['tt_device']}, {m['impl']}) | Est: {m['est_size_gb']} | Target: {m['local_path']}"
+                f"Spec: {m['tt_spec_model']} ({m['tt_device']}, {m['impl']}) | Est: {m['est_size_gb']} | "
+                f"{m.get('cache_badge_plain', '')} | Target: {m['local_path']}"
             )
 
     return combined
@@ -1967,104 +2839,260 @@ def build_tt_inference_command(model_entry: dict, service_port: int = 8000) -> l
     return cmd
 
 
-def classify_startup_phase(log_line: str, current_phase: str) -> tuple[str, bool]:
-    """Map a container log line to a human-readable startup milestone phase."""
-    low = log_line.lower()
-    is_milestone = False
+class StartupProgressTracker:
+    """
+    Deterministic container log substage & progress tracker for QB2 vLLM + TT-Metal startup:
+      • Detects Warm TT-Metal Cache vs. Cold First-Run Kernel/Weight Compilation
+      • Tracks `.safetensors` shard loading progress (`A/B shards, X%`)
+      • Tracks TT-Metal layer cache generation (`layer X/Y`) & RISC-V kernel compiles
+      • Tracks builtin prefill/decode warmup (`warmup_model_prefill`, `warmup_model_decode`)
+      • Tracks deterministic 11-step prompt_client trace capture (`seq_len = 128..130944`)
+      • Computes live progress % and estimated time remaining (ETA)
+    """
 
-    if any(
-        k in low
-        for k in (
-            "opening device",
-            "chip_ids",
-            "tt-metal",
-            "fabric",
-            "mesh_device",
-            "initializing tensor parallel",
+    def __init__(self, model_entry: dict | None = None) -> None:
+        self.model_entry = model_entry or {}
+        self.current_phase = "[Phase 1/5] Container Started — Bootstrapping Python & vLLM EngineCore"
+        self.cache_warm_initial = bool(self.model_entry.get("cache_warm", False))
+        self.saw_cold_compile = False
+        self.warm_est_sec = int(self.model_entry.get("warm_est_sec") or 120)
+        self.cold_est_sec = int(self.model_entry.get("cold_est_sec") or 420)
+        self.est_total_sec = self.warm_est_sec if self.cache_warm_initial else self.cold_est_sec
+
+        self.shards_done = 0
+        self.shards_total = 0
+        self.trace_total = len(TRACE_CAPTURE_SEQ_LENS)
+        self.trace_done = 0
+        self.last_trace_seq_len = 0
+        self.kernel_compiles = 0
+        self.substage_detail = "Initializing container runtime"
+
+    def feed(self, log_line: str) -> tuple[str, bool, str | None]:
+        """
+        Process a container log line and return `(current_phase, is_milestone, extra_badge)`.
+        """
+        low = log_line.lower()
+        is_milestone = False
+        extra_badge: str | None = None
+        new_phase = self.current_phase
+
+        # Detect cold compilation triggers
+        if "riscv-tt-elf-g++" in low:
+            self.kernel_compiles += 1
+            if "[Phase 5/5]" not in self.current_phase:
+                self.substage_detail = (
+                    f"Compiling Blackhole RISC-V TT-Metal kernels ({self.kernel_compiles} compiled)"
+                )
+
+        if (
+            "first-run tensor cache warmup detected" in low
+            or "generating cache for" in low
+            or (
+                "riscv-tt-elf-g++" in low
+                and (not self.cache_warm_initial or self.kernel_compiles >= 50)
+            )
+        ):
+            if not self.saw_cold_compile:
+                self.saw_cold_compile = True
+                self.est_total_sec = self.cold_est_sec
+                extra_badge = (
+                    f"[Cold TT-Metal Compile Detected — updated ETA target to ~{_format_duration(self.est_total_sec)}]"
+                )
+            if "riscv-tt-elf-g++" in low:
+                return self.current_phase, (self.kernel_compiles % 25 == 1), extra_badge
+
+        # Phase 2: Blackhole Mesh & Device Init
+        if any(
+            k in low
+            for k in (
+                "opening device",
+                "opening subset of mmio",
+                "chip_ids",
+                "fabric",
+                "mesh_device",
+                "multidevice with",
+                "initializing tensor parallel",
+            )
+        ):
+            new_phase = "[Phase 2/5] Initializing Tenstorrent Blackhole Mesh (4x p300c / 8 Tensix chips)"
+            if "[Phase 1/5]" in self.current_phase or "[Phase 2/5]" in self.current_phase:
+                self.substage_detail = "Bringing up 4x p300c PCIe boards & Ethernet fabric"
+
+        # Phase 3: Weight Shards & TT-Metal Cache Loading
+        if any(
+            k in low
+            for k in (
+                "loading weights",
+                "loading safetensors",
+                "model loading took",
+                "loading model",
+                "set tt_cache_path",
+            )
+        ):
+            new_phase = "[Phase 3/5] Loading .safetensors Model Weights & TT-Metal Tensor Cache"
+            m_prog = re.search(r"(\d+)%\|.*?\|\s*(\d+)/(\d+)", log_line)
+            if m_prog:
+                pct, done_s, tot_s = int(m_prog.group(1)), int(m_prog.group(2)), int(m_prog.group(3))
+                self.shards_done, self.shards_total = done_s, tot_s
+                self.substage_detail = f"Loading weights ({done_s}/{tot_s} items, {pct}%)"
+                extra_badge = f"[Weights: {done_s}/{tot_s} ({pct}%)]"
+                is_milestone = pct in (0, 25, 50, 75, 100) or done_s == tot_s
+
+        # Phase 4: KV Cache, Prefill/Decode Warmup & Trace Capture
+        if any(
+            k in low
+            for k in (
+                "capturing traces",
+                "warming up prefill",
+                "starting decode warmup",
+                "warming up decode",
+                "decode warmup completed",
+                "kv cache",
+                "init engine (profile, create kv cache, warmup model)",
+            )
+        ):
+            new_phase = "[Phase 4/5] Allocating KV Cache, Prefill/Decode Warmup & Capturing Hardware Traces"
+
+            m_trace_cnt = re.search(r"capturing traces:\s*(\d+)\s*context lengths", low)
+            if m_trace_cnt:
+                self.trace_total = int(m_trace_cnt.group(1))
+                self.substage_detail = f"Capturing execution traces ({self.trace_total} context lengths)"
+                is_milestone = True
+
+            m_trace_seq = re.search(r"input_seq_len=(\d+)", low)
+            if m_trace_seq:
+                seq_len = int(m_trace_seq.group(1))
+                self.last_trace_seq_len = seq_len
+                if seq_len in TRACE_SEQ_INDEX:
+                    self.trace_done = min(self.trace_total, TRACE_SEQ_INDEX[seq_len])
+                else:
+                    self.trace_done = min(self.trace_total, self.trace_done + 1)
+                self.substage_detail = (
+                    f"Trace Capture [{self.trace_done}/{self.trace_total}] (input_seq_len={seq_len:,})"
+                )
+                extra_badge = f"[Trace {self.trace_done}/{self.trace_total}: seq_len={seq_len:,}]"
+                is_milestone = True
+
+            m_prefill = re.search(r"warming up prefill for sequence length:\s*(\d+)", low)
+            if m_prefill:
+                p_len = int(m_prefill.group(1))
+                self.substage_detail = f"Warming up TT-Metal prefill kernel (seq_len={p_len:,})"
+                extra_badge = f"[Prefill Warmup: seq_len={p_len:,}]"
+                is_milestone = True
+
+            if "starting decode warmup" in low:
+                self.substage_detail = "Running TT-Metal autoregressive decode warmup passes"
+                extra_badge = "[Decode Warmup Started]"
+                is_milestone = True
+            elif "decode warmup completed" in low:
+                self.substage_detail = "TT-Metal decode warmup complete"
+                extra_badge = "[Decode Warmup Complete]"
+                is_milestone = True
+
+        # Phase 5: HTTP API Server Startup
+        if any(
+            k in low
+            for k in (
+                "application startup complete",
+                "uvicorn running on",
+                "starting vllm api server",
+                "chat template warmup completed",
+            )
+        ):
+            new_phase = "[Phase 5/5] vLLM OpenAI API Server Starting HTTP Listener"
+            self.substage_detail = "HTTP API listener active & finishing final readiness check"
+            is_milestone = True
+
+        if new_phase != self.current_phase and new_phase[:9] > self.current_phase[:9]:
+            self.current_phase = new_phase
+            return self.current_phase, True, extra_badge
+
+        if any(
+            k in low
+            for k in (
+                "initializing a v1 llm engine",
+                "set tt_cache_path",
+                "model has builtin warmup",
+                "init engine (profile",
+                "chat template warmup completed",
+                "application startup complete",
+                "uvicorn running",
+                "error",
+                "exception",
+                "fatal",
+            )
+        ):
+            is_milestone = True
+
+        return self.current_phase, is_milestone, extra_badge
+
+    def format_eta_status(self, elapsed_sec: int) -> str:
+        """Return a formatted progress % and ETA countdown string."""
+        est = max(1, self.est_total_sec)
+        if self.trace_done > 0 and self.trace_total > 0:
+            # During deterministic trace capture (final 25% of bring-up), blend trace progress
+            pct = min(99, int(72 + (self.trace_done / self.trace_total) * 26))
+        else:
+            pct = min(98, int((elapsed_sec / est) * 100))
+        rem = max(0, est - elapsed_sec)
+        mode_str = "Cold Compile" if self.saw_cold_compile else (
+            "Warm Cache" if self.cache_warm_initial else "Cold/First Load"
         )
-    ):
-        new_phase = "[Phase 2/5] Initializing Tenstorrent Blackhole Mesh (4x p300c / 8 Tensix chips)"
-        if new_phase != current_phase:
-            return new_phase, True
-    if any(
-        k in low
-        for k in ("loading weights", "safetensors", "model loading took", "loading model")
-    ):
-        new_phase = "[Phase 3/5] Loading .safetensors Model Weights & Compiling TT-Metal Kernels"
-        if new_phase != current_phase:
-            return new_phase, True
-    if any(
-        k in low
-        for k in ("capturing", "trace", "warming up", "warmup", "kv cache", "allocated")
-    ):
-        new_phase = "[Phase 4/5] Allocating KV Cache & Capturing Prefill/Decode Hardware Traces"
-        if new_phase != current_phase:
-            return new_phase, True
-    if any(
-        k in low
-        for k in ("application startup complete", "uvicorn running on", "starting vllm api server")
-    ):
-        new_phase = "[Phase 5/5] vLLM OpenAI API Server Starting HTTP Listener"
-        if new_phase != current_phase:
-            return new_phase, True
-
-    if any(
-        k in low
-        for k in (
-            "initializing",
-            "loading weights",
-            "model loading",
-            "kv cache",
-            "trace",
-            "warmup",
-            "uvicorn running",
-            "application startup complete",
-            "error",
-            "exception",
-            "fatal",
+        if rem > 0:
+            return (
+                f"{pct:2d}% | ~{_format_duration(rem)} rem "
+                f"(est ~{_format_duration(est)} [{mode_str}]) | {self.substage_detail}"
+            )
+        return (
+            f"99% | Finalizing (>~{_format_duration(est)} [{mode_str}]) | {self.substage_detail}"
         )
-    ):
-        is_milestone = True
-
-    return current_phase, is_milestone
 
 
 def monitor_container_until_ready(
     container_name: str,
     display_name: str,
     service_port: int = 8000,
-    timeout_sec: int = 1800,
+    timeout_sec: int = 2400,
+    model_entry: dict | None = None,
 ) -> bool:
     """
-    Actively stream startup progress from `docker logs -f <container_name>` while polling
-    `/health` and `/v1/models` on `service_port` until the model is ready to serve requests.
+    Actively stream deterministic startup progress from `docker logs -f <container_name>`
+    with live ETA countdown while polling `/health` and `/v1/models` on `service_port`
+    until the model is ready to serve requests, then record the load time to `load_timings_cache.json`.
     """
     start_ts = time.time()
-    current_phase = "[Phase 1/5] Container Started — Bootstrapping Python & vLLM EngineCore"
+    tracker = StartupProgressTracker(model_entry=model_entry)
+    cache_mode_desc = (
+        f"Warm TT-Metal Cache (`{model_entry.get('cache_vol_name')}`, {model_entry.get('cache_vol_gb', 0.0):.1f} GB) — Est. Load: ~{_format_duration(tracker.est_total_sec)}"
+        if (model_entry and model_entry.get("cache_warm"))
+        else f"Cold / First-Boot Compile — Est. Load: ~{_format_duration(tracker.est_total_sec)}"
+    )
 
     if HAS_RICH:
         console.print(
             Panel(
-                f"[bold cyan]Container:[/bold cyan] [white]{container_name}[/white]\n"
-                f"[bold cyan]Model:[/bold cyan]     [white]{display_name}[/white]\n"
-                f"[bold cyan]Endpoint:[/bold cyan]  [white]http://localhost:{service_port}/v1/models[/white]\n"
-                "[dim]Streaming live container startup milestones below until HTTP readiness (`200 OK`)...[/dim]",
-                title="[bold cyan]Stage 4 — Active Model Bring-Up & Readiness Monitor[/bold cyan]",
+                f"[bold cyan]Container:[/bold cyan]      [white]{container_name}[/white]\n"
+                f"[bold cyan]Model:[/bold cyan]          [white]{display_name}[/white]\n"
+                f"[bold cyan]TT-Cache Mode:[/bold cyan]  [bold green]{cache_mode_desc}[/bold green]\n"
+                f"[bold cyan]Endpoint:[/bold cyan]       [white]http://localhost:{service_port}/v1/models[/white]\n"
+                "[dim]Streaming live deterministic startup milestones, trace capture progress & ETA below...[/dim]",
+                title="[bold cyan]Stage 4 — Active Model Bring-Up, Trace Capture & Readiness Monitor[/bold cyan]",
                 border_style="cyan",
             )
         )
-        console.print(f"  [bold yellow]→ {current_phase}[/bold yellow]")
+        console.print(f"  [bold yellow]→ {tracker.current_phase}[/bold yellow]")
     else:
         print(
-            f"\n=== Stage 4: Monitoring {container_name} ({display_name}) until ready on port {service_port} ==="
+            f"\n=== Stage 4: Monitoring {container_name} ({display_name}) | {cache_mode_desc} ==="
         )
-        print(f"  -> {current_phase}")
+        print(f"  -> {tracker.current_phase}")
 
     stop_event = threading.Event()
     fatal_error: list[str] = []
+    shown_phase = tracker.current_phase
 
     def _log_streamer() -> None:
-        nonlocal current_phase
+        nonlocal shown_phase
         proc = subprocess.Popen(
             ["docker", "logs", "-f", "--tail", "25", container_name],
             stdout=subprocess.PIPE,
@@ -2081,15 +3109,21 @@ def monitor_container_until_ready(
                     if not line:
                         continue
                     elapsed = int(time.time() - start_ts)
-                    new_phase, is_milestone = classify_startup_phase(line, current_phase)
-                    if new_phase != current_phase:
-                        current_phase = new_phase
+                    new_phase, is_milestone, extra_badge = tracker.feed(line)
+                    if new_phase != shown_phase:
+                        shown_phase = new_phase
+                        eta_s = tracker.format_eta_status(elapsed)
                         if HAS_RICH:
                             console.print(
-                                f"\n  [bold yellow][+{elapsed:3d}s] → {current_phase}[/bold yellow]"
+                                f"\n  [bold yellow][+{elapsed:3d}s | {eta_s}][/bold yellow]\n"
+                                f"  [bold yellow]→ {shown_phase}[/bold yellow]"
                             )
                         else:
-                            print(f"\n  [+{elapsed:3d}s] -> {current_phase}")
+                            print(f"\n  [+{elapsed:3d}s | {eta_s}]\n  -> {shown_phase}")
+                    if extra_badge and HAS_RICH:
+                        console.print(f"    [bold cyan][+{elapsed:3d}s] {extra_badge}[/bold cyan]")
+                    elif extra_badge:
+                        print(f"    [+{elapsed:3d}s] {extra_badge}")
                     if is_milestone:
                         trimmed = line if len(line) <= 125 else line[:122] + "..."
                         if HAS_RICH:
@@ -2141,26 +3175,36 @@ def monitor_container_until_ready(
                 if ep:
                     stop_event.set()
                     elapsed = int(time.time() - start_ts)
+                    was_warm = tracker.cache_warm_initial and not tracker.saw_cold_compile
+                    if model_entry and model_entry.get("hf_repo"):
+                        record_model_load_timing(
+                            model_entry["hf_repo"], elapsed, is_warm=was_warm
+                        )
+                    mode_tag = "warm cache" if was_warm else "cold compile"
                     if HAS_RICH:
                         console.print(
-                            f"\n  [bold green][+{elapsed:3d}s] ✓ [Phase 5/5] vLLM Server Ready! "
-                            f"Serving `{ep['served_model_id']}` at {ep['endpoint']} (max_model_len={ep['max_model_len']})[/bold green]\n"
+                            f"\n  [bold green][+{elapsed:3d}s ({_format_duration(elapsed)}, {mode_tag})] "
+                            f"✓ [Phase 5/5] vLLM Server Ready! "
+                            f"Serving `{ep['served_model_id']}` at {ep['endpoint']} "
+                            f"(max_model_len={ep['max_model_len']}) — recorded to `load_timings_cache.json`[/bold green]\n"
                         )
                     else:
                         print(
-                            f"\n  [+{elapsed:3d}s] ✓ vLLM Server Ready! Serving {ep['served_model_id']} at {ep['endpoint']}\n"
+                            f"\n  [+{elapsed:3d}s ({_format_duration(elapsed)}, {mode_tag})] "
+                            f"✓ vLLM Server Ready! Serving {ep['served_model_id']} at {ep['endpoint']}\n"
                         )
                     return True
 
             if time.time() - last_heartbeat >= 15.0:
                 elapsed = int(time.time() - start_ts)
+                eta_s = tracker.format_eta_status(elapsed)
                 if HAS_RICH:
                     console.print(
-                        f"    [cyan][+{elapsed:3d}s] Still warming up ({current_phase})... waiting for HTTP 200 on port {service_port}[/cyan]"
+                        f"    [cyan][+{elapsed:3d}s | {eta_s}][/cyan]"
                     )
                 else:
                     print(
-                        f"    [+{elapsed:3d}s] Still warming up ({current_phase})... waiting for HTTP 200 on port {service_port}"
+                        f"    [+{elapsed:3d}s | {eta_s}]"
                     )
                 last_heartbeat = time.time()
 
@@ -2197,6 +3241,7 @@ def launch_and_monitor_model(chosen: dict, service_port: int = 8000) -> bool:
             Panel(
                 f"[bold]Starting Model:[/bold]  [bold white]{chosen['display_name']}[/bold white]\n"
                 f"[bold]Weights Path:[/bold]    `{chosen['local_path']}`\n"
+                f"[bold]TT-Metal Cache:[/bold]  {chosen.get('cache_badge', 'N/A')}\n"
                 f"[bold]Working Dir:[/bold]     `{TT_INFERENCE_DIR}`\n"
                 f"[bold]Launch Command:[/bold]  `{' '.join(launch_cmd)}`",
                 title="[bold cyan]Stage 3 — Launching TT-Inference-Server Container[/bold cyan]",
@@ -2256,6 +3301,7 @@ def launch_and_monitor_model(chosen: dict, service_port: int = 8000) -> bool:
         container_name=launched_container_name,
         display_name=chosen["display_name"],
         service_port=service_port,
+        model_entry=chosen,
     )
 
 
@@ -2264,7 +3310,7 @@ def launch_and_monitor_model(chosen: dict, service_port: int = 8000) -> bool:
 # ==============================================================================
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Unified QB2 Model Manager: Inspect active model & handles, rank all downloaded and supported QB2 models by Frontier Proximity %, and gracefully switch/start models."
+        description="Unified QB2 Model Manager: Inspect active model & handles, rank all downloaded and supported QB2 models by Frontier Proximity %, inspect `config.json` architectures & Docker/TT-Metal caches, and gracefully switch/start models."
     )
     parser.add_argument(
         "--status",
@@ -2277,6 +3323,28 @@ def main() -> int:
         "--dev",
         action="store_true",
         help="Include experimental/nightly QB2 specs from `workflows/model_specs/dev/llm.yaml` and `dev/vlm.yaml`",
+    )
+    parser.add_argument(
+        "--arch",
+        nargs="?",
+        const=0,
+        type=int,
+        default=None,
+        help="Display deep `config.json` architecture & shard inspector for all downloaded models (or model #N) and exit",
+    )
+    parser.add_argument(
+        "--images",
+        "--storage",
+        dest="inspect_images",
+        action="store_true",
+        help="Display local Docker images, TT-Metal cache volumes (`volume_id_*`), and host cache storage and exit",
+    )
+    parser.add_argument(
+        "--prune",
+        "--prune-images",
+        dest="prune_storage",
+        action="store_true",
+        help="Safely prune dangling `<none>` Docker images, unused Docker build cache, and empty 0B TT-Metal volumes and exit",
     )
     parser.add_argument(
         "--refresh-ranks",
@@ -2337,6 +3405,22 @@ def main() -> int:
         downloaded_models, available_to_pull, state=state, include_dev=args.dev
     )
 
+    if args.arch is not None:
+        target_idx = args.arch if args.arch > 0 else None
+        display_architecture_inspector(downloaded_models, target_idx=target_idx)
+        return 0
+
+    if args.inspect_images:
+        storage = inspect_docker_and_cache_storage(state, combined)
+        display_docker_and_cache_inspector(storage)
+        return 0
+
+    if args.prune_storage:
+        storage = inspect_docker_and_cache_storage(state, combined)
+        display_docker_and_cache_inspector(storage)
+        prune_docker_and_caches(storage)
+        return 0
+
     if args.status_only:
         return 0
 
@@ -2366,14 +3450,14 @@ def main() -> int:
             if HAS_RICH:
                 console.print()
                 prompt_str = (
-                    f"[bold cyan]Load new model? Enter model number [1-{len(combined)}] "
-                    f"('r' to refresh HF ranks, 's' to stop active model, 'q' to quit): [/bold cyan]"
+                    f"[bold cyan]Load new model? Enter model # [1-{len(combined)}] "
+                    f"('a' arch inspector, 'i' Docker/cache storage, 'p' safe prune, 'r' refresh ranks, 's' stop model, 'q' quit): [/bold cyan]"
                 )
                 raw = console.input(prompt_str).strip()
             else:
                 raw = input(
-                    f"\nLoad new model? Enter model number [1-{len(combined)}] "
-                    f"('r' to refresh HF ranks, 's' to stop active model, 'q' to quit): "
+                    f"\nLoad new model? Enter model # [1-{len(combined)}] "
+                    f"('a' arch, 'i' storage, 'p' prune, 'r' refresh, 's' stop, 'q' quit): "
                 ).strip()
         except (EOFError, KeyboardInterrupt):
             print("\nNo changes made. Exiting.")
@@ -2387,6 +3471,27 @@ def main() -> int:
             else:
                 print("✓ Exiting without changes — existing QB2 model state left untouched.")
             return 0
+
+        m_arch = re.match(r"^(?:a|arch)(?:\s+(\d+))?$", raw, flags=re.I)
+        if m_arch:
+            t_idx = int(m_arch.group(1)) if m_arch.group(1) else None
+            display_architecture_inspector(downloaded_models, target_idx=t_idx)
+            continue
+
+        if raw.lower() in ("i", "images", "storage"):
+            run_storage_cleanup_menu(state, combined)
+            continue
+
+        if raw.lower() in ("p", "prune"):
+            storage = inspect_docker_and_cache_storage(state, combined)
+            prune_docker_and_caches(storage)
+            downloaded_models, available_to_pull = partition_models(
+                include_dev=args.dev, refresh_ranks=False
+            )
+            combined = display_storage_and_catalog(
+                downloaded_models, available_to_pull, state=state, include_dev=args.dev
+            )
+            continue
 
         if raw.lower() in ("r", "refresh"):
             downloaded_models, available_to_pull = partition_models(
@@ -2408,7 +3513,7 @@ def main() -> int:
 
         if not raw.isdigit():
             print(
-                f"Invalid selection: {raw!r}. Please enter a model number between 1 and {len(combined)}, 'r', 's', or 'q'."
+                f"Invalid selection: {raw!r}. Enter a model number [1..{len(combined)}], 'a [N]', 'i', 'p', 'r', 's', or 'q'."
             )
             continue
 
