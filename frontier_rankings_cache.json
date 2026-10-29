@@ -1,0 +1,203 @@
+{
+  "Qwen/Qwen3.8-27B": {
+    "score": 90.7,
+    "tier": "S-Tier",
+    "source": "HF Table (TerminalBench:73, SWE-bench-Pro:62, IFEval:80)",
+    "created": "2026-08-05",
+    "likes": 18615,
+    "benches": {
+      "TerminalBench": 73.0,
+      "SWE-bench-Pro": 61.7,
+      "IFEval": 79.5,
+      "GPQA": 89.2,
+      "HLE": 30.8,
+      "LiveCodeBench": 90.3
+    }
+  },
+  "Qwen/Qwen3.6-27B": {
+    "score": 86.4,
+    "tier": "A+ Tier",
+    "source": "HF Table (TerminalBench:63, SWE-bench-Pro:54, IFEval:69)",
+    "created": "2026-04-21",
+    "likes": 2342,
+    "benches": {
+      "TerminalBench": 63.4,
+      "SWE-bench-Pro": 53.5,
+      "IFEval": 69.1,
+      "GPQA": 87.8,
+      "HLE": 24.0,
+      "LiveCodeBench": 83.9,
+      "SWE-bench-Ver": 77.2,
+      "MMLU-Pro": 86.2,
+      "MMLU-Redux": 93.5,
+      "AIME": 94.1
+    }
+  },
+  "google/gemma-4-31B-it": {
+    "score": 86.9,
+    "tier": "A+ Tier",
+    "source": "HF Table (MMLU-Pro:85, MMLU-Redux:94, GPQA:84)",
+    "created": "2026-03-11",
+    "likes": 4226,
+    "benches": {
+      "SWE-bench-Ver": 52.0,
+      "SWE-bench-Pro": 35.7,
+      "MMLU-Pro": 85.2,
+      "MMLU-Redux": 93.7,
+      "GPQA": 84.3,
+      "HLE": 26.5,
+      "LiveCodeBench": 80.0,
+      "AIME": 89.2,
+      "MMLU": 88.4
+    }
+  },
+  "google/gemma-4-12B-it": {
+    "score": 76.9,
+    "tier": "B+ Tier",
+    "source": "HF Table (MMLU-Pro:77, AIME:78, LiveCodeBench:72)",
+    "created": "2026-05-23",
+    "likes": 1696,
+    "benches": {
+      "MMLU-Pro": 77.2,
+      "AIME": 77.5,
+      "LiveCodeBench": 72.0,
+      "GPQA": 78.8,
+      "MMLU": 83.4
+    }
+  },
+  "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B": {
+    "score": 78.7,
+    "tier": "B+ Tier",
+    "source": "HF Table (AIME:73, MATH-500:94, GPQA:62)",
+    "created": "2025-01-20",
+    "likes": 1664,
+    "benches": {
+      "AIME": 72.6,
+      "MATH-500": 94.3,
+      "GPQA": 62.1,
+      "LiveCodeBench": 57.2
+    }
+  },
+  "meta-llama/Llama-3.3-70B-Instruct": {
+    "score": 68.9,
+    "tier": "B/C+ Tier",
+    "source": "HF Table (MMLU:86, MMLU-Pro:69, IFEval:92)",
+    "created": "2024-11-26",
+    "likes": 3172,
+    "benches": {
+      "MMLU": 86.0,
+      "MMLU-Pro": 68.9,
+      "IFEval": 92.1,
+      "GPQA": 50.5,
+      "HumanEval": 88.4,
+      "MATH-500": 77.0,
+      "BFCL": 77.3
+    }
+  },
+  "Qwen/Qwen3-32B": {
+    "score": 86.8,
+    "tier": "A+ Tier",
+    "source": "HF Metadata (32B `<think>`, 2025-04-27)",
+    "created": "2025-04-27",
+    "likes": 788,
+    "benches": {}
+  },
+  "meta-llama/Llama-3.1-70B-Instruct": {
+    "score": 65.3,
+    "tier": "B/C+ Tier",
+    "source": "HF Table (MMLU:86, MMLU-Pro:66, IFEval:88)",
+    "created": "2024-07-16",
+    "likes": 1019,
+    "benches": {
+      "MMLU": 86.0,
+      "MMLU-Pro": 66.4,
+      "IFEval": 87.5,
+      "GPQA": 48.0,
+      "HumanEval": 80.5,
+      "MATH-500": 68.0,
+      "BFCL": 77.5
+    }
+  },
+  "meta-llama/Llama-3.1-8B-Instruct": {
+    "score": 45.3,
+    "tier": "C Tier",
+    "source": "HF Table (MMLU:73, MMLU-Pro:48, IFEval:80)",
+    "created": "2024-07-18",
+    "likes": 8656,
+    "benches": {
+      "MMLU": 73.0,
+      "MMLU-Pro": 48.3,
+      "IFEval": 80.4,
+      "GPQA": 31.8,
+      "HumanEval": 72.6,
+      "MATH-500": 51.9,
+      "BFCL": 65.4
+    }
+  },
+  "Qwen/QwQ-32B": {
+    "score": 86.4,
+    "tier": "A+ Tier",
+    "source": "HF Table + RL Release (2025-03-05)",
+    "created": "2025-03-05",
+    "likes": 2971,
+    "benches": {
+      "AIME": 44.0,
+      "MATH-500": 90.6,
+      "GPQA": 54.5,
+      "LiveCodeBench": 41.9
+    }
+  },
+  "Qwen/Qwen2.5-Coder-32B-Instruct": {
+    "score": 78.5,
+    "tier": "B+ Tier",
+    "source": "HF Metadata (Code 32B, 2024-11-06)",
+    "created": "2024-11-06",
+    "likes": 2195,
+    "benches": {}
+  },
+  "meta-llama/Llama-3.1-70B": {
+    "score": 54.5,
+    "tier": "C Tier",
+    "source": "HF Metadata (Base, 2024-07-14)",
+    "created": "2024-07-14",
+    "likes": 446,
+    "benches": {}
+  },
+  "deepseek-ai/DeepSeek-R1-Distill-Llama-70B": {
+    "score": 79.2,
+    "tier": "B+ Tier",
+    "source": "HF Table (AIME:70, MATH-500:94, GPQA:65)",
+    "created": "2025-01-20",
+    "likes": 823,
+    "benches": {
+      "AIME": 70.0,
+      "MATH-500": 94.5,
+      "GPQA": 65.2,
+      "LiveCodeBench": 57.5
+    }
+  },
+  "meta-llama/Llama-3.1-8B": {
+    "score": 44.5,
+    "tier": "C Tier",
+    "source": "HF Metadata (Base, 2024-07-14)",
+    "created": "2024-07-14",
+    "likes": 2720,
+    "benches": {}
+  },
+  "openai/gpt-oss-120b": {
+    "score": 89.0,
+    "tier": "S-Tier",
+    "source": "HF Metadata (120B MoE, 2025-08-04)",
+    "created": "2025-08-04",
+    "likes": 5454,
+    "benches": {}
+  },
+  "google/diffusiongemma-26B-A4B-it": {
+    "score": 78.0,
+    "tier": "B+ Tier",
+    "source": "HF Metadata (26B-A4B, 2026-06-09)",
+    "created": "2026-06-09",
+    "likes": 1315,
+    "benches": {}
+  }
+}

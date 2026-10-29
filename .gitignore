@@ -1,0 +1,10 @@
+Archive/
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+AGENT.md
+PRIVATE_*.md
+private_tests/
