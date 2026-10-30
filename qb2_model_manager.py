@@ -1932,7 +1932,7 @@ DEFAULT_LOAD_TIMINGS = {
     "Qwen/Qwen3-32B": {"warm_samples_sec": [86, 119, 88], "cold_samples_sec": [418]},
     "Qwen/QwQ-32B": {"warm_samples_sec": [92], "cold_samples_sec": [420]},
     "Qwen/Qwen2.5-Coder-32B-Instruct": {"warm_samples_sec": [92], "cold_samples_sec": [420]},
-    "Qwen/Qwen3.8-27B": {"warm_samples_sec": [145], "cold_samples_sec": [405]},
+    "Qwen/Qwen3.8-27B": {"warm_samples_sec": [405, 431], "cold_samples_sec": [405, 431]},
     "openai/gpt-oss-120b": {"warm_samples_sec": [210], "cold_samples_sec": [1713]},
     "meta-llama/Llama-3.1-70B-Instruct": {"warm_samples_sec": [621], "cold_samples_sec": [1367]},
     "meta-llama/Llama-3.1-8B-Instruct": {"warm_samples_sec": [255, 256], "cold_samples_sec": [346]},
@@ -2056,8 +2056,8 @@ def annotate_model_cache_and_load_estimate(
     warm_samples = (rec or {}).get("warm_samples_sec") or []
     cold_samples = (rec or {}).get("cold_samples_sec") or []
 
-    has_kernel_vol = matched_vol in vol_sizes and matched_gb > 0.0 and bool(warm_samples)
-    cache_warm = (matched_gb >= 0.1) or has_kernel_vol
+    cache_warm = matched_gb >= 0.1
+    is_direct_qb2 = impl_name.endswith("_qb2")
 
     warm_est_sec = int(round(statistics.mean(warm_samples))) if warm_samples else default_warm
     cold_est_sec = int(round(statistics.mean(cold_samples))) if cold_samples else default_cold
@@ -2077,12 +2077,12 @@ def annotate_model_cache_and_load_estimate(
         entry["cache_badge_plain"] = (
             f"Warm Cache ({matched_gb:.1f} GB, ~{_format_duration(warm_est_sec)} load)"
         )
-    elif has_kernel_vol:
+    elif is_direct_qb2:
         entry["cache_badge"] = (
-            f"[bold green]Warm Kernel Cache[/bold green] • ~{_format_duration(warm_est_sec)} load (~{_format_duration(cold_est_sec)} cold)"
+            f"[cyan]Direct DRAM + Warmup[/cyan] • ~{_format_duration(cold_est_sec)} load"
         )
         entry["cache_badge_plain"] = (
-            f"Warm Kernel Cache (~{_format_duration(warm_est_sec)} load)"
+            f"Direct DRAM + Warmup (~{_format_duration(cold_est_sec)} load)"
         )
     else:
         entry["cache_badge"] = (
@@ -2843,9 +2843,9 @@ class StartupProgressTracker:
     """
     Deterministic container log substage & progress tracker for QB2 vLLM + TT-Metal startup:
       • Detects Warm TT-Metal Cache vs. Cold First-Run Kernel/Weight Compilation
-      • Tracks `.safetensors` shard loading progress (`A/B shards, X%`)
-      • Tracks TT-Metal layer cache generation (`layer X/Y`) & RISC-V kernel compiles
-      • Tracks builtin prefill/decode warmup (`warmup_model_prefill`, `warmup_model_decode`)
+      • Tracks `.safetensors` shard loading progress (`A/B shards, X%`) via both container logs and host `/proc/<pid>/fd`
+      • Tracks TT-Metal layer cache loading (`A/B layers`) & RISC-V kernel compiles (`riscv-tt-elf-g++`)
+      • Tracks builtin prefill/decode warmup (`warmup_model_prefill`, `warmup_model_decode`, `Qwen3.8 prefill startup warmup`)
       • Tracks deterministic 11-step prompt_client trace capture (`seq_len = 128..130944`)
       • Computes live progress % and estimated time remaining (ETA)
     """
@@ -2860,12 +2860,25 @@ class StartupProgressTracker:
         self.est_total_sec = self.warm_est_sec if self.cache_warm_initial else self.cold_est_sec
 
         self.shards_done = 0
-        self.shards_total = 0
+        self.shards_total = int(self.model_entry.get("n_shards") or 0)
+        self.layers_done = 0
+        arch_info = self.model_entry.get("arch_info") or {}
+        self.layers_total = int(arch_info.get("num_layers") or 0)
         self.trace_total = len(TRACE_CAPTURE_SEQ_LENS)
         self.trace_done = 0
         self.last_trace_seq_len = 0
+        self.capturing_traces = False
+        self.traces_completed = False
         self.kernel_compiles = 0
-        self.substage_detail = "Initializing container runtime"
+        self.saw_decode_trace = False
+        self.substage_detail = "Initializing container runtime & vLLM plugins"
+
+    @property
+    def phase_num(self) -> int:
+        try:
+            return int(self.current_phase[7])
+        except Exception:
+            return 1
 
     def feed(self, log_line: str) -> tuple[str, bool, str | None]:
         """
@@ -2876,92 +2889,239 @@ class StartupProgressTracker:
         extra_badge: str | None = None
         new_phase = self.current_phase
 
-        # Detect cold compilation triggers
+        # Detect RISC-V TT-Metal kernel compiles first (before filtering compiler warning flags)
         if "riscv-tt-elf-g++" in low:
             self.kernel_compiles += 1
-            if "[Phase 5/5]" not in self.current_phase:
+            if self.phase_num < 5:
                 self.substage_detail = (
                     f"Compiling Blackhole RISC-V TT-Metal kernels ({self.kernel_compiles} compiled)"
                 )
+            if not self.cache_warm_initial or self.kernel_compiles >= 50:
+                if not self.saw_cold_compile:
+                    self.saw_cold_compile = True
+                    self.est_total_sec = self.cold_est_sec
+                    return (
+                        self.current_phase,
+                        True,
+                        f"[TT-Metal Kernel Compilation Active — ETA target ~{_format_duration(self.est_total_sec)}]",
+                    )
+            if self.kernel_compiles == 1 or self.kernel_compiles % 50 == 0:
+                return (
+                    self.current_phase,
+                    False,
+                    f"[TT-Metal RISC-V Kernels Compiled: {self.kernel_compiles}]",
+                )
+            return self.current_phase, False, None
 
-        if (
-            "first-run tensor cache warmup detected" in low
-            or "generating cache for" in low
-            or (
-                "riscv-tt-elf-g++" in low
-                and (not self.cache_warm_initial or self.kernel_compiles >= 50)
+        # Skip noisy compiler warning lines from C++ kernel builds
+        if any(
+            w in low
+            for w in (
+                "warning: variable",
+                "in file included from",
+                "in function 'void kernel_main",
+                "[-wunused",
             )
-        ):
+        ) or re.match(r"^\s*\d+\s*\|", log_line) or re.match(r"^\s*\|\s*\^", log_line):
+            return self.current_phase, False, None
+
+        m_build_step = re.search(r"building\s+(brisc|ncrisc|trisc),\s*compile step", low)
+        if m_build_step:
+            if self.phase_num in (3, 4):
+                self.substage_detail = (
+                    f"Building {m_build_step.group(1).upper()} firmware & warmup kernels ({self.kernel_compiles} compiled)"
+                )
+            return self.current_phase, False, None
+
+        if "first-run tensor cache warmup detected" in low or "generating cache for" in low:
             if not self.saw_cold_compile:
                 self.saw_cold_compile = True
                 self.est_total_sec = self.cold_est_sec
                 extra_badge = (
                     f"[Cold TT-Metal Compile Detected — updated ETA target to ~{_format_duration(self.est_total_sec)}]"
                 )
-            if "riscv-tt-elf-g++" in low:
-                return self.current_phase, (self.kernel_compiles % 25 == 1), extra_badge
+                is_milestone = True
+
+        # Phase 1 milestones (Container & vLLM EngineCore Bootstrap)
+        if "using model spec:" in low:
+            spec_id = log_line.split("Using model spec:")[-1].strip()
+            self.substage_detail = f"Loaded runtime spec `{spec_id}`"
+            extra_badge = f"[Runtime Spec: {spec_id}]"
+            is_milestone = True
+        elif "parse safetensors files:" in low:
+            m_parse = re.search(r"(\d+)%\|.*?\|\s*(\d+)/(\d+)", log_line)
+            if m_parse:
+                pct, done_s, tot_s = int(m_parse.group(1)), int(m_parse.group(2)), int(m_parse.group(3))
+                self.shards_total = max(self.shards_total, tot_s)
+                self.substage_detail = f"Indexing .safetensors headers ({done_s}/{tot_s} shards, {pct}%)"
+                if done_s == tot_s or pct == 0:
+                    extra_badge = f"[Indexed .safetensors Headers: {done_s}/{tot_s} shards ({pct}%)]"
+        elif "resolved architecture:" in low:
+            arch_name = log_line.split("Resolved architecture:")[-1].strip()
+            self.substage_detail = f"Resolved vLLM architecture `{arch_name}`"
+            extra_badge = f"[vLLM Architecture: {arch_name}]"
+            is_milestone = True
+        elif "initializing a v1 llm engine" in low:
+            self.substage_detail = "Spawning vLLM V1 EngineCore process"
+            is_milestone = True
 
         # Phase 2: Blackhole Mesh & Device Init
         if any(
             k in low
             for k in (
-                "opening device",
+                "opening user mode device driver",
+                "starting topology discovery",
+                "still waiting on eth training",
+                "opening local chip ids",
                 "opening subset of mmio",
-                "chip_ids",
-                "fabric",
-                "mesh_device",
+                "initializing fabric",
+                "fabric initialized on 4 devices",
+                "fabric initialized with config",
+                "attempting to open mesh device",
                 "multidevice with",
                 "initializing tensor parallel",
             )
         ):
             new_phase = "[Phase 2/5] Initializing Tenstorrent Blackhole Mesh (4x p300c / 8 Tensix chips)"
-            if "[Phase 1/5]" in self.current_phase or "[Phase 2/5]" in self.current_phase:
-                self.substage_detail = "Bringing up 4x p300c PCIe boards & Ethernet fabric"
+            if "starting topology discovery" in low or "opening user mode device driver" in low:
+                self.substage_detail = "Discovering 4x p300c Blackhole topology"
+                is_milestone = True
+            elif "still waiting on eth training" in low:
+                m_eth = re.search(r"\((\d+)\s*ms elapsed", low)
+                eth_s = int(m_eth.group(1)) // 1000 if m_eth else 5
+                self.substage_detail = f"Training Blackhole Ethernet interconnect links ({eth_s}s elapsed)"
+                extra_badge = f"[Blackhole ETH Link Training: {eth_s}s elapsed]"
+            elif "opening local chip ids" in low:
+                self.substage_detail = "Opened PCIe MMIO handles across 4x p300c boards {0, 1, 2, 3}"
+                extra_badge = "[PCIe MMIO Opened: 4x p300c boards {0, 1, 2, 3}]"
+                is_milestone = True
+            elif "initializing fabric" in low:
+                self.substage_detail = "Initializing Blackhole 1D/Ring Ethernet fabric"
+            elif "fabric initialized on 4 devices" in low:
+                self.substage_detail = "Blackhole 4-device interconnect fabric initialized"
+                extra_badge = "[Blackhole 4-Device Fabric Ready]"
+                is_milestone = True
+            elif "multidevice with" in low:
+                self.substage_detail = "Created (1, 4) Blackhole multi-device mesh"
+                extra_badge = "[Blackhole (1x4) Mesh Device Active]"
+                is_milestone = True
 
         # Phase 3: Weight Shards & TT-Metal Cache Loading
-        if any(
+        is_phase3_line = any(
             k in low
             for k in (
+                "ttmodelrunner: trace_mode=",
+                "loading checkpoint shards",
+                "checkpoint directory:",
                 "loading weights",
                 "loading safetensors",
                 "model loading took",
-                "loading model",
-                "set tt_cache_path",
+                "loading qwen3.8 layer",
+                "loading gemma4 layer",
+                "qwen3.8 model loaded",
+                "gemma4 model loaded",
+                "qwen3.8 vllm precision:",
             )
-        ):
+        )
+        # Also detect bare tqdm layer bars `  25%|██▌ | 16/64` in tt_transformers during Phase 2/3
+        m_tqdm = re.search(r"(\d+)%\|.*?\|\s*(\d+)/(\d+)", log_line)
+        is_bare_layer_bar = (
+            m_tqdm is not None
+            and self.phase_num in (2, 3)
+            and "parse safetensors" not in low
+            and "allocating tt kv caches" not in low
+            and "loading checkpoint shards" not in low
+        )
+
+        if is_phase3_line or is_bare_layer_bar:
             new_phase = "[Phase 3/5] Loading .safetensors Model Weights & TT-Metal Tensor Cache"
-            m_prog = re.search(r"(\d+)%\|.*?\|\s*(\d+)/(\d+)", log_line)
-            if m_prog:
-                pct, done_s, tot_s = int(m_prog.group(1)), int(m_prog.group(2)), int(m_prog.group(3))
+            if "ttmodelrunner: trace_mode=" in low:
+                shard_hint = f" ({self.shards_total} shards)" if self.shards_total else ""
+                self.substage_detail = f"Streaming model weights{shard_hint} into 4x p300c Blackhole DRAM"
+                is_milestone = True
+            elif "loading checkpoint shards" in low and m_tqdm:
+                pct, done_s, tot_s = int(m_tqdm.group(1)), int(m_tqdm.group(2)), int(m_tqdm.group(3))
+                prev_done = self.shards_done
                 self.shards_done, self.shards_total = done_s, tot_s
-                self.substage_detail = f"Loading weights ({done_s}/{tot_s} items, {pct}%)"
-                extra_badge = f"[Weights: {done_s}/{tot_s} ({pct}%)]"
-                is_milestone = pct in (0, 25, 50, 75, 100) or done_s == tot_s
+                self.substage_detail = f"Loading .safetensors shards ({done_s}/{tot_s} shards, {pct}%)"
+                if done_s != prev_done or done_s in (0, tot_s):
+                    extra_badge = f"[Weights Shard: {done_s}/{tot_s} ({pct}%)]"
+                    is_milestone = done_s in (0, 1, tot_s) or (done_s % max(1, tot_s // 5) == 0)
+            elif is_bare_layer_bar and m_tqdm:
+                pct, done_l, tot_l = int(m_tqdm.group(1)), int(m_tqdm.group(2)), int(m_tqdm.group(3))
+                prev_l = self.layers_done
+                self.layers_done, self.layers_total = done_l, tot_l
+                self.substage_detail = f"Loading TT-Metal transformer layers ({done_l}/{tot_l} layers, {pct}%)"
+                if done_l != prev_l and (
+                    done_l in (1, tot_l) or done_l % max(1, tot_l // 4) == 0
+                ):
+                    extra_badge = f"[TT-Metal Layers Loaded: {done_l}/{tot_l} ({pct}%)]"
+            elif "loading gemma4 layer" in low or "loading qwen3.8 layer" in low:
+                m_lyr = re.search(r"layer\s+(\d+)", low)
+                if m_lyr:
+                    l_idx = int(m_lyr.group(1)) + 1
+                    tot_l = self.layers_total or 64
+                    self.layers_done = l_idx
+                    pct = int((l_idx / tot_l) * 100)
+                    self.substage_detail = f"Uploading transformer layer {l_idx}/{tot_l} ({pct}%) to Blackhole DRAM"
+                    if l_idx in (1, tot_l) or l_idx % 8 == 0:
+                        extra_badge = f"[Transformer Layer Upload: {l_idx}/{tot_l} ({pct}%)]"
+            elif "qwen3.8 model loaded" in low or "gemma4 model loaded" in low:
+                if self.shards_total:
+                    self.shards_done = self.shards_total
+                if self.layers_total:
+                    self.layers_done = self.layers_total
+                self.substage_detail = "All model weight layers uploaded to Blackhole DRAM"
+                extra_badge = "[All Model Weights Uploaded to Blackhole DRAM (100%)]"
+                is_milestone = True
 
         # Phase 4: KV Cache, Prefill/Decode Warmup & Trace Capture
         if any(
             k in low
             for k in (
+                "gpu kv cache size:",
+                "allocating tt kv caches",
                 "capturing traces",
+                "text trace completed:",
                 "warming up prefill",
+                "qwen3.8 prefill startup warmup",
                 "starting decode warmup",
                 "warming up decode",
+                "_capture_decode_trace_text",
                 "decode warmup completed",
-                "kv cache",
+                "warming model trace",
+                "capturing model trace",
                 "init engine (profile, create kv cache, warmup model)",
             )
         ):
             new_phase = "[Phase 4/5] Allocating KV Cache, Prefill/Decode Warmup & Capturing Hardware Traces"
 
+            m_kv_sz = re.search(r"gpu kv cache size:\s*([\d,]+\s*tokens)", low)
+            if m_kv_sz:
+                kv_str = m_kv_sz.group(1)
+                self.substage_detail = f"Allocated Blackhole PagedAttention KV cache ({kv_str}) & warming up prefill/decode"
+                extra_badge = f"[Paged KV Cache Allocated: {kv_str}]"
+                is_milestone = True
+
+            if "allocating tt kv caches" in low and m_tqdm:
+                pct, done_k, tot_k = int(m_tqdm.group(1)), int(m_tqdm.group(2)), int(m_tqdm.group(3))
+                self.substage_detail = f"Allocating on-device KV cache buffers ({done_k}/{tot_k} layers, {pct}%)"
+                if done_k in (1, tot_k // 2, tot_k):
+                    extra_badge = f"[Allocating Layer KV Caches: {done_k}/{tot_k} ({pct}%)]"
+
             m_trace_cnt = re.search(r"capturing traces:\s*(\d+)\s*context lengths", low)
             if m_trace_cnt:
                 self.trace_total = int(m_trace_cnt.group(1))
+                self.capturing_traces = True
+                self.traces_completed = False
                 self.substage_detail = f"Capturing execution traces ({self.trace_total} context lengths)"
+                extra_badge = f"[Trace Capture Started: {self.trace_total} context lengths]"
                 is_milestone = True
 
-            m_trace_seq = re.search(r"input_seq_len=(\d+)", low)
+            m_trace_seq = re.search(r"capturing traces for input_seq_len=(\d+)", low)
             if m_trace_seq:
                 seq_len = int(m_trace_seq.group(1))
+                self.capturing_traces = True
                 self.last_trace_seq_len = seq_len
                 if seq_len in TRACE_SEQ_INDEX:
                     self.trace_done = min(self.trace_total, TRACE_SEQ_INDEX[seq_len])
@@ -2973,6 +3133,13 @@ class StartupProgressTracker:
                 extra_badge = f"[Trace {self.trace_done}/{self.trace_total}: seq_len={seq_len:,}]"
                 is_milestone = True
 
+            if "text trace completed:" in low and self.capturing_traces:
+                if self.trace_done >= self.trace_total or self.last_trace_seq_len >= 130944:
+                    self.traces_completed = True
+                    self.substage_detail = f"Completed all {self.trace_total}/{self.trace_total} context length traces"
+                    extra_badge = f"[All {self.trace_total}/{self.trace_total} Context Length Traces Captured]"
+                    is_milestone = True
+
             m_prefill = re.search(r"warming up prefill for sequence length:\s*(\d+)", low)
             if m_prefill:
                 p_len = int(m_prefill.group(1))
@@ -2980,28 +3147,58 @@ class StartupProgressTracker:
                 extra_badge = f"[Prefill Warmup: seq_len={p_len:,}]"
                 is_milestone = True
 
+            if "qwen3.8 prefill startup warmup" in low:
+                m_qsec = re.search(r'"seconds":\s*([\d.]+)', log_line)
+                sec_s = f" in {float(m_qsec.group(1)):.1f}s" if m_qsec else ""
+                self.substage_detail = f"Completed Qwen3.8 16-occupancy prefill warmup{sec_s}"
+                extra_badge = f"[Qwen3.8 16-Occupancy Prefill Warmup Complete{sec_s}]"
+                is_milestone = True
+
             if "starting decode warmup" in low:
                 self.substage_detail = "Running TT-Metal autoregressive decode warmup passes"
                 extra_badge = "[Decode Warmup Started]"
                 is_milestone = True
+            elif "_capture_decode_trace_text" in low and not self.saw_decode_trace:
+                self.saw_decode_trace = True
+                self.substage_detail = "Capturing on-device decode execution trace"
+                extra_badge = "[Captured On-Device Decode Trace]"
+                is_milestone = True
             elif "decode warmup completed" in low:
                 self.substage_detail = "TT-Metal decode warmup complete"
                 extra_badge = "[Decode Warmup Complete]"
+                is_milestone = True
+            elif "warming model trace" in low or "capturing model trace" in low:
+                self.substage_detail = log_line.split("-")[-1].strip()
+                extra_badge = f"[{self.substage_detail}]"
+                is_milestone = True
+
+            m_init_eng = re.search(r"init engine \(profile, create kv cache, warmup model\) took\s*([\d.]+)", low)
+            if m_init_eng:
+                sec_val = float(m_init_eng.group(1))
+                self.substage_detail = f"Engine profile, KV cache & warmup completed in {sec_val:.1f}s"
+                extra_badge = f"[Engine Init, KV Cache & Warmup Complete ({sec_val:.1f}s)]"
                 is_milestone = True
 
         # Phase 5: HTTP API Server Startup
         if any(
             k in low
             for k in (
+                "ready from local core engine process",
+                "chat template warmup completed",
+                "starting vllm server on",
+                "starting vllm api server",
                 "application startup complete",
                 "uvicorn running on",
-                "starting vllm api server",
-                "chat template warmup completed",
             )
         ):
             new_phase = "[Phase 5/5] vLLM OpenAI API Server Starting HTTP Listener"
             self.substage_detail = "HTTP API listener active & finishing final readiness check"
-            is_milestone = True
+            if "chat template warmup completed" in low:
+                extra_badge = "[Chat Template Warmup Complete]"
+                is_milestone = True
+            elif "starting vllm" in low:
+                extra_badge = "[vLLM HTTP Server Listening on Port 8000]"
+                is_milestone = True
 
         if new_phase != self.current_phase and new_phase[:9] > self.current_phase[:9]:
             self.current_phase = new_phase
@@ -3010,13 +3207,7 @@ class StartupProgressTracker:
         if any(
             k in low
             for k in (
-                "initializing a v1 llm engine",
-                "set tt_cache_path",
                 "model has builtin warmup",
-                "init engine (profile",
-                "chat template warmup completed",
-                "application startup complete",
-                "uvicorn running",
                 "error",
                 "exception",
                 "fatal",
@@ -3036,7 +3227,7 @@ class StartupProgressTracker:
             pct = min(98, int((elapsed_sec / est) * 100))
         rem = max(0, est - elapsed_sec)
         mode_str = "Cold Compile" if self.saw_cold_compile else (
-            "Warm Cache" if self.cache_warm_initial else "Cold/First Load"
+            "Warm Cache" if self.cache_warm_initial else "Direct DRAM + Warmup"
         )
         if rem > 0:
             return (
@@ -3048,6 +3239,45 @@ class StartupProgressTracker:
         )
 
 
+def _find_enginecore_pid() -> int | None:
+    """Return the host PID of the active `VLLM::EngineCore` process on the QB2, if running."""
+    rc, out, _ = run_cmd(["pgrep", "-f", "VLLM::EngineCore"], timeout=2.0)
+    if rc == 0 and out:
+        for tok in out.split():
+            if tok.isdigit():
+                return int(tok)
+    return None
+
+
+def _inspect_enginecore_open_shard(pid: int) -> tuple[int, int, str] | None:
+    """
+    Check `/proc/<pid>/fd` and `/proc/<pid>/maps` for an open `model-000XX-of-000YY.safetensors` file.
+    Returns `(shard_idx, total_shards, filename)` if found, in <0.2ms using direct `/proc` syscalls.
+    """
+    fd_dir = Path(f"/proc/{pid}/fd")
+    pat = re.compile(r"(model-(\d+)-of-(\d+)\.safetensors)")
+    try:
+        if fd_dir.exists():
+            for entry in os.listdir(fd_dir):
+                try:
+                    target = os.readlink(fd_dir / entry)
+                    m = pat.search(target)
+                    if m:
+                        return int(m.group(2)), int(m.group(3)), m.group(1)
+                except OSError:
+                    continue
+        maps_file = Path(f"/proc/{pid}/maps")
+        if maps_file.exists():
+            txt = maps_file.read_text(errors="ignore")
+            matches = pat.findall(txt)
+            if matches:
+                fname, s_idx, s_tot = matches[-1]
+                return int(s_idx), int(s_tot), fname
+    except Exception:
+        pass
+    return None
+
+
 def monitor_container_until_ready(
     container_name: str,
     display_name: str,
@@ -3057,15 +3287,15 @@ def monitor_container_until_ready(
 ) -> bool:
     """
     Actively stream deterministic startup progress from `docker logs -f <container_name>`
-    with live ETA countdown while polling `/health` and `/v1/models` on `service_port`
-    until the model is ready to serve requests, then record the load time to `load_timings_cache.json`.
+    plus host `VLLM::EngineCore` `.safetensors` shard activity with live ETA countdown
+    while polling `/health` and `/v1/models` on `service_port` until ready.
     """
     start_ts = time.time()
     tracker = StartupProgressTracker(model_entry=model_entry)
     cache_mode_desc = (
         f"Warm TT-Metal Cache (`{model_entry.get('cache_vol_name')}`, {model_entry.get('cache_vol_gb', 0.0):.1f} GB) — Est. Load: ~{_format_duration(tracker.est_total_sec)}"
         if (model_entry and model_entry.get("cache_warm"))
-        else f"Cold / First-Boot Compile — Est. Load: ~{_format_duration(tracker.est_total_sec)}"
+        else f"Direct DRAM Upload / First-Boot Compile — Est. Load: ~{_format_duration(tracker.est_total_sec)}"
     )
 
     if HAS_RICH:
@@ -3075,7 +3305,7 @@ def monitor_container_until_ready(
                 f"[bold cyan]Model:[/bold cyan]          [white]{display_name}[/white]\n"
                 f"[bold cyan]TT-Cache Mode:[/bold cyan]  [bold green]{cache_mode_desc}[/bold green]\n"
                 f"[bold cyan]Endpoint:[/bold cyan]       [white]http://localhost:{service_port}/v1/models[/white]\n"
-                "[dim]Streaming live deterministic startup milestones, trace capture progress & ETA below...[/dim]",
+                "[dim]Streaming live deterministic startup milestones, shard/layer progress, trace capture & ETA below...[/dim]",
                 title="[bold cyan]Stage 4 — Active Model Bring-Up, Trace Capture & Readiness Monitor[/bold cyan]",
                 border_style="cyan",
             )
@@ -3090,11 +3320,12 @@ def monitor_container_until_ready(
     stop_event = threading.Event()
     fatal_error: list[str] = []
     shown_phase = tracker.current_phase
+    print_lock = threading.Lock()
 
     def _log_streamer() -> None:
         nonlocal shown_phase
         proc = subprocess.Popen(
-            ["docker", "logs", "-f", "--tail", "25", container_name],
+            ["docker", "logs", "-f", container_name],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -3110,26 +3341,27 @@ def monitor_container_until_ready(
                         continue
                     elapsed = int(time.time() - start_ts)
                     new_phase, is_milestone, extra_badge = tracker.feed(line)
-                    if new_phase != shown_phase:
-                        shown_phase = new_phase
-                        eta_s = tracker.format_eta_status(elapsed)
-                        if HAS_RICH:
-                            console.print(
-                                f"\n  [bold yellow][+{elapsed:3d}s | {eta_s}][/bold yellow]\n"
-                                f"  [bold yellow]→ {shown_phase}[/bold yellow]"
-                            )
-                        else:
-                            print(f"\n  [+{elapsed:3d}s | {eta_s}]\n  -> {shown_phase}")
-                    if extra_badge and HAS_RICH:
-                        console.print(f"    [bold cyan][+{elapsed:3d}s] {extra_badge}[/bold cyan]")
-                    elif extra_badge:
-                        print(f"    [+{elapsed:3d}s] {extra_badge}")
-                    if is_milestone:
-                        trimmed = line if len(line) <= 125 else line[:122] + "..."
-                        if HAS_RICH:
-                            console.print(f"    [dim][+{elapsed:3d}s] {trimmed}[/dim]")
-                        else:
-                            print(f"    [+{elapsed:3d}s] {trimmed}")
+                    with print_lock:
+                        if new_phase != shown_phase:
+                            shown_phase = new_phase
+                            eta_s = tracker.format_eta_status(elapsed)
+                            if HAS_RICH:
+                                console.print(
+                                    f"\n  [bold yellow][+{elapsed:3d}s | {eta_s}][/bold yellow]\n"
+                                    f"  [bold yellow]→ {shown_phase}[/bold yellow]"
+                                )
+                            else:
+                                print(f"\n  [+{elapsed:3d}s | {eta_s}]\n  -> {shown_phase}")
+                        if extra_badge and HAS_RICH:
+                            console.print(f"    [bold cyan][+{elapsed:3d}s] {extra_badge}[/bold cyan]")
+                        elif extra_badge:
+                            print(f"    [+{elapsed:3d}s] {extra_badge}")
+                        if is_milestone:
+                            trimmed = line if len(line) <= 125 else line[:122] + "..."
+                            if HAS_RICH:
+                                console.print(f"    [dim][+{elapsed:3d}s] {trimmed}[/dim]")
+                            else:
+                                print(f"    [+{elapsed:3d}s] {trimmed}")
                     if (
                         "device hang" in line.lower()
                         or "enginecore encountered a fatal error" in line.lower()
@@ -3141,8 +3373,50 @@ def monitor_container_until_ready(
             except Exception:
                 pass
 
+    def _host_shard_poller() -> None:
+        """
+        Lightweight 0.2s `/proc/<EngineCore_pid>/fd` poller that catches `.safetensors`
+        shard transitions (`1/18 .. 18/18`) for models like `Qwen3.8-27B` that use
+        `safetensors.safe_open` directly without printing a tqdm progress bar.
+        """
+        ec_pid: int | None = None
+        last_pid_lookup = 0.0
+        seen_host_shards: set[int] = set()
+
+        while not stop_event.is_set():
+            if tracker.phase_num in (2, 3):
+                now = time.time()
+                if ec_pid is None and (now - last_pid_lookup) >= 2.0:
+                    ec_pid = _find_enginecore_pid()
+                    last_pid_lookup = now
+                if ec_pid is not None:
+                    res = _inspect_enginecore_open_shard(ec_pid)
+                    if res:
+                        s_idx, s_tot, fname = res
+                        if s_idx > tracker.shards_done and s_idx not in seen_host_shards:
+                            seen_host_shards.add(s_idx)
+                            tracker.shards_done = s_idx
+                            tracker.shards_total = s_tot
+                            pct = int((s_idx / max(1, s_tot)) * 100)
+                            tracker.substage_detail = (
+                                f"Uploading .safetensors shard {s_idx}/{s_tot} ({pct}%) to Blackhole DRAM"
+                            )
+                            elapsed = int(now - start_ts)
+                            with print_lock:
+                                if HAS_RICH:
+                                    console.print(
+                                        f"    [bold cyan][+{elapsed:3d}s] [Weights Shard: {s_idx}/{s_tot} ({pct}%) — {fname}][/bold cyan]"
+                                    )
+                                else:
+                                    print(
+                                        f"    [+{elapsed:3d}s] [Weights Shard: {s_idx}/{s_tot} ({pct}%) — {fname}]"
+                                    )
+            time.sleep(0.2)
+
     log_thread = threading.Thread(target=_log_streamer, daemon=True)
     log_thread.start()
+    shard_thread = threading.Thread(target=_host_shard_poller, daemon=True)
+    shard_thread.start()
 
     last_heartbeat = time.time()
     try:
@@ -3170,7 +3444,9 @@ def monitor_container_until_ready(
                     print(f"\n✗ Container {container_name} exited unexpectedly during startup.")
                 return False
 
-            if check_vllm_health(service_port):
+            if check_vllm_health(service_port) and (
+                not tracker.capturing_traces or tracker.traces_completed
+            ):
                 ep = query_vllm_endpoint(service_port)
                 if ep:
                     stop_event.set()
@@ -3180,35 +3456,37 @@ def monitor_container_until_ready(
                         record_model_load_timing(
                             model_entry["hf_repo"], elapsed, is_warm=was_warm
                         )
-                    mode_tag = "warm cache" if was_warm else "cold compile"
-                    if HAS_RICH:
-                        console.print(
-                            f"\n  [bold green][+{elapsed:3d}s ({_format_duration(elapsed)}, {mode_tag})] "
-                            f"✓ [Phase 5/5] vLLM Server Ready! "
-                            f"Serving `{ep['served_model_id']}` at {ep['endpoint']} "
-                            f"(max_model_len={ep['max_model_len']}) — recorded to `load_timings_cache.json`[/bold green]\n"
-                        )
-                    else:
-                        print(
-                            f"\n  [+{elapsed:3d}s ({_format_duration(elapsed)}, {mode_tag})] "
-                            f"✓ vLLM Server Ready! Serving {ep['served_model_id']} at {ep['endpoint']}\n"
-                        )
+                    mode_tag = "warm cache" if was_warm else "direct/cold compile"
+                    with print_lock:
+                        if HAS_RICH:
+                            console.print(
+                                f"\n  [bold green][+{elapsed:3d}s ({_format_duration(elapsed)}, {mode_tag})] "
+                                f"✓ [Phase 5/5] vLLM Server Ready! "
+                                f"Serving `{ep['served_model_id']}` at {ep['endpoint']} "
+                                f"(max_model_len={ep['max_model_len']}) — recorded to `load_timings_cache.json`[/bold green]\n"
+                            )
+                        else:
+                            print(
+                                f"\n  [+{elapsed:3d}s ({_format_duration(elapsed)}, {mode_tag})] "
+                                f"✓ vLLM Server Ready! Serving {ep['served_model_id']} at {ep['endpoint']}\n"
+                            )
                     return True
 
             if time.time() - last_heartbeat >= 15.0:
                 elapsed = int(time.time() - start_ts)
                 eta_s = tracker.format_eta_status(elapsed)
-                if HAS_RICH:
-                    console.print(
-                        f"    [cyan][+{elapsed:3d}s | {eta_s}][/cyan]"
-                    )
-                else:
-                    print(
-                        f"    [+{elapsed:3d}s | {eta_s}]"
-                    )
+                with print_lock:
+                    if HAS_RICH:
+                        console.print(
+                            f"    [cyan][+{elapsed:3d}s | {eta_s}][/cyan]"
+                        )
+                    else:
+                        print(
+                            f"    [+{elapsed:3d}s | {eta_s}]"
+                        )
                 last_heartbeat = time.time()
 
-            time.sleep(3.0)
+            time.sleep(2.5)
     except KeyboardInterrupt:
         stop_event.set()
         if HAS_RICH:
@@ -3233,7 +3511,11 @@ def monitor_container_until_ready(
 
 
 def launch_and_monitor_model(chosen: dict, service_port: int = 8000) -> bool:
-    """Launch the selected model via `run.py` and actively monitor container startup until ready."""
+    """
+    Launch the selected model via `run.py` and immediately transition into
+    `monitor_container_until_ready` (`Stage 4`) as soon as `run.py` starts the
+    Docker container (without blocking on `run.py`'s silent 5400s health wait).
+    """
     launch_cmd = build_tt_inference_command(chosen, service_port=service_port)
 
     if HAS_RICH:
@@ -3262,25 +3544,61 @@ def launch_and_monitor_model(chosen: dict, service_port: int = 8000) -> bool:
     )
 
     launched_container_name: str | None = None
+    handed_off_to_stage4 = False
+
     if proc.stdout:
         for line in proc.stdout:
             line_s = line.rstrip()
-            if line_s:
-                if HAS_RICH:
-                    console.print(f"  [dim]{line_s}[/dim]")
-                else:
-                    print(f"  {line_s}")
-                m = re.search(r"--name\s+(tt-inference-server-[a-zA-Z0-9_.-]+)", line_s)
-                if m:
-                    launched_container_name = m.group(1)
+            if not line_s:
+                continue
+            if HAS_RICH:
+                console.print(f"  [dim]{line_s}[/dim]")
+            else:
+                print(f"  {line_s}")
 
-    rc = proc.wait()
-    if rc != 0:
-        if HAS_RICH:
-            console.print(f"[bold red]✗ `run.py` exited with code {rc}.[/bold red]")
-        else:
-            print(f"✗ run.py exited with code {rc}.")
-        return False
+            m = re.search(r"--name\s+(tt-inference-server-[a-zA-Z0-9_.-]+)", line_s)
+            if m:
+                launched_container_name = m.group(1)
+
+            low_s = line_s.lower()
+            # As soon as `run.py` starts the container and begins its own silent health wait,
+            # hand off immediately to Stage 4 (`monitor_container_until_ready`)!
+            if launched_container_name and (
+                ("waiting up to" in low_s and "for inference server readiness" in low_s)
+                or "running docker container with log file:" in low_s
+                or "created docker container id:" in low_s
+            ):
+                handed_off_to_stage4 = True
+                break
+
+    if handed_off_to_stage4:
+        def _drain_run_py() -> None:
+            try:
+                if proc.stdout:
+                    for _ in proc.stdout:
+                        pass
+                proc.wait()
+            except Exception:
+                pass
+
+        threading.Thread(target=_drain_run_py, daemon=True).start()
+        # Wait up to 3s for the Docker daemon to register the container as running
+        for _ in range(12):
+            rc_c, run_s, _ = run_cmd(
+                ["docker", "inspect", "-f", "{{.State.Running}}", launched_container_name],
+                timeout=2.0,
+            )
+            if rc_c == 0 and run_s.strip().lower() == "true":
+                break
+            time.sleep(0.25)
+    else:
+        rc = proc.wait()
+        if rc != 0:
+            if HAS_RICH:
+                console.print(f"[bold red]✗ `run.py` exited with code {rc}.[/bold red]")
+            else:
+                print(f"✗ run.py exited with code {rc}.")
+            return False
 
     if not launched_container_name:
         time.sleep(1.0)
@@ -3291,7 +3609,7 @@ def launch_and_monitor_model(chosen: dict, service_port: int = 8000) -> bool:
     if not launched_container_name:
         if HAS_RICH:
             console.print(
-                "[bold red]✗ Could not find a running `tt-inference-server` Docker container after `run.py` completed.[/bold red]"
+                "[bold red]✗ Could not find a running `tt-inference-server` Docker container after `run.py` launched.[/bold red]"
             )
         else:
             print("✗ Could not find a running tt-inference-server Docker container.")

@@ -30,11 +30,11 @@
       "notes": "Shares Qwen3-32B 64-layer P300X2 TT-Metal cache geometry"
     },
     "Qwen/Qwen3.8-27B": {
-      "warm_samples_sec": [145],
-      "cold_samples_sec": [405],
+      "warm_samples_sec": [405, 431],
+      "cold_samples_sec": [405, 431],
       "last_mode": "cold",
-      "last_duration_sec": 405,
-      "notes": "Measured on QB2 p300x2 (v0.25.0 qwen38_27b_qb2, 262K ctx)"
+      "last_duration_sec": 431,
+      "notes": "Measured on QB2 p300x2 (v0.25.0 qwen38_27b_qb2, direct 18-shard DRAM upload + 16-occupancy prefill warmup)"
     },
     "openai/gpt-oss-120b": {
       "warm_samples_sec": [210],
