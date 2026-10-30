@@ -40,8 +40,9 @@ Instead of listing models alphabetically, `qb2_model_manager.py` ranks every dow
 
 ---
 
-### 3. Authoritative YAML Spec Discovery & Validated 32B Architectural Bridges
+### 3. Authoritative YAML Spec Discovery, Experimental Model Support (`--dev`) & Validated 32B Architectural Bridges
 * **Direct YAML Catalog Parsing:** Reads `/home/ttuser/.local/lib/tt-inference-server/workflows/model_specs/prod/llm.yaml` (and `dev/llm.yaml` + `dev/vlm.yaml` with `--dev`), preserving multiple engine implementations per model (`tt-transformers` vs. `tt-forge-vllm`).
+* **Experimental & Dev-Catalog Model Loading (`--dev`):** Passing `--dev` unlocks **16 additional experimental `P300X2` LLM and VLM configurations** from `dev/llm.yaml` and `dev/vlm.yaml` that are omitted from `prod` and `model_spec.json` — including `google/gemma-4-26B-A4B-it` (both `tt-transformers` and `tt-forge-vllm`), `Qwen/Qwen2.5-VL-32B-Instruct`, `Qwen/Qwen2.5-VL-72B-Instruct`, `meta-llama/Llama-3.2-90B-Vision-Instruct`, `meta-llama/Llama-3.2-11B-Vision-Instruct`, and experimental `EXPERIMENTAL`-status models (`openai/gpt-oss-120b`, `Qwen/Qwen3.6-27B`, `google/diffusiongemma-26B-A4B-it`). Selecting any experimental model automatically pulls its weights from Hugging Face (if not yet cached) and passes `--dev-mode` (`MODEL_SPECS_ENV=dev`) and `--impl` to `run.py`.
 * **Multi-Root Weight Discovery:** Scans `/home/ttuser/models/<org>/<repo>`, `/home/ttuser/data/tt-cache/volume_id_*/weights/*`, and custom local `.safetensors` directories, verifying that all shards are complete (no `.incomplete` files) and automatically passing `--host-weights-dir` to `run.py`.
 * **Validated 32B Architectural Bridges:** Enables `P300X2` execution for **64-layer, 5120-hidden, 40Q/8KV GQA** models (`deepseek-ai/DeepSeek-R1-Distill-Qwen-32B`, `Qwen/QwQ-32B`, `Qwen/Qwen2.5-Coder-32B-Instruct`) using the `Qwen/Qwen3-32B` `p300x2` TT-Metal mesh specification.
 * **Automatic PR `#55630` Patch Injection:** Automatically injects the local `0.17.0-8c48a10-f52987a-pr55630` Docker image when launching `Qwen3-32B` and its bridged 32B models to prevent prefix-caching slot collision crashes.
