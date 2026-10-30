@@ -6,6 +6,10 @@
 
 It unifies deep hardware/container forensics, an automated **Hugging Face Frontier Proximity %** benchmark ranker, local `.safetensors` and `config.json` architecture inspection, `tt-metal` warm/cold cache analysis, safe multi-chip resets (`tt-smi -r`), and a deterministic 5-phase bring-up progress tracker into a single command (`./qb2_model_manager`).
 
+<p align="center">
+  <img src="assets/qb2_model_manager_startup.svg" alt="qb2_model_manager Live Terminal Output on Tenstorrent QuietBox 2 (P300X2)" width="100%">
+</p>
+
 ---
 
 ## Key Features
